@@ -2,3 +2,4 @@ venv
 .venv
 */__pycache__/
 output/synthetic_patients/
+.DS_STORE

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -561,26 +562,28 @@ def main() -> None:
     print_summary(freq_df, n_patients, top_n=args.top)
 
     print("\n[7/8] Saving aggregation results …")
+    run_dir = args.output_dir / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    args.output_dir = run_dir
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    variant_csv = args.output_dir / "variant_level_analysis.csv"
+    # variant_csv = args.output_dir / "variant_level_analysis.csv"
     gene_csv    = args.output_dir / "gene_level_analysis.csv"
     bin_csv     = args.output_dir / args.bin_output_name
-    freq_df.to_csv(variant_csv, index=False)
+    # freq_df.to_csv(variant_csv, index=False)
     gene_df.to_csv(gene_csv,    index=False)
     if not bin_df.empty:
         bin_df.to_csv(bin_csv, index=False)
-    print(f"  Variant-level results saved to : {variant_csv.resolve()}")
+    # print(f"  Variant-level results saved to : {variant_csv.resolve()}")
     print(f"  Gene-level results saved to    : {gene_csv.resolve()}")
     if not bin_df.empty:
         print(f"  Bin-level results saved to     : {bin_csv.resolve()}")
 
     print("\n[8/8] Generating plots …")
-    make_figure(
+    '''make_figure(
         freq_df, offsets, n_patients,
         top_n=args.top,
         min_freq=args.min_freq,
         output_path=args.output_dir / args.output_name,
-    )
+    )'''
     make_gene_figure(
         gene_df, offsets, n_patients,
         top_n=args.top,

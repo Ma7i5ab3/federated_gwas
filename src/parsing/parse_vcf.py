@@ -160,29 +160,8 @@ def parse_vcf(vcf_path: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_all_vcfs(data_dir: str | Path = "data") -> pd.DataFrame:
-    """
-    Parse all .vcf files found in *data_dir* and concatenate the results
-    into a single DataFrame.
-
-    Parameters
-    ----------
-    data_dir : directory that contains the .vcf files (default: "data/")
-
-    Returns
-    -------
-    pd.DataFrame combining all patients, reset index.
-    """
-    data_dir = Path(data_dir)
-    vcf_files = sorted(data_dir.glob("*.vcf"))
-
-    if not vcf_files:
-        raise FileNotFoundError(f"No .vcf files found in {data_dir.resolve()}")
-
-    frames = [parse_vcf(f) for f in vcf_files]
-    df = pd.concat(frames, ignore_index=True)
-
-    # Define the desired column order (columns not present stay as-is at the end)
+def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the desired column order to a DataFrame."""
     desired_columns = [
         "Patient_ID", "CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
         # VEP CSQ fields
@@ -198,12 +177,33 @@ def parse_all_vcfs(data_dir: str | Path = "data") -> pd.DataFrame:
         # FORMAT / sample fields
         "GT", "GQ", "DP", "AD", "VAF", "PL",
     ]
-    # Keep only the columns that actually exist in the dataframe
     ordered = [c for c in desired_columns if c in df.columns]
     extra   = [c for c in df.columns if c not in desired_columns]
-    df = df[ordered + extra]
+    return df[ordered + extra]
 
-    return df
+
+def parse_all_vcfs(data_dir: str | Path = "data") -> dict[str, pd.DataFrame]:
+    """
+    Parse all .vcf files found in *data_dir* and return one DataFrame per patient.
+
+    Parameters
+    ----------
+    data_dir : directory that contains the .vcf files (default: "data/")
+
+    Returns
+    -------
+    dict mapping patient_id -> pd.DataFrame
+    """
+    data_dir = Path(data_dir)
+    vcf_files = sorted(data_dir.glob("*.vcf"))
+
+    if not vcf_files:
+        raise FileNotFoundError(f"No .vcf files found in {data_dir.resolve()}")
+
+    return {
+        vcf_file.stem: _reorder_columns(parse_vcf(vcf_file))
+        for vcf_file in vcf_files
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +217,16 @@ if __name__ == "__main__":
     data_dir   = script_dir.parent / "data"
     output_dir = script_dir.parent / "output"
     output_dir.mkdir(exist_ok=True)
+    parsed_dir = output_dir / "parsed"
+    parsed_dir.mkdir(exist_ok=True)
 
     print(f"Scanning for VCF files in: {data_dir.resolve()}")
-    df = parse_all_vcfs(data_dir)
+    patients = parse_all_vcfs(data_dir)
 
-    print(f"Parsed {len(df)} variant-transcript rows from {df['Patient_ID'].nunique()} patient(s).")
-    print(df.head())
+    total_rows = sum(len(df) for df in patients.values())
+    print(f"Parsed {total_rows} variant-transcript rows from {len(patients)} patient(s).")
 
-    out_path = output_dir / "variants.csv"
-    df.to_csv(out_path, index=False)
-    print(f"\nSaved to: {out_path.resolve()}")
+    for patient_id, df in patients.items():
+        out_path = parsed_dir / f"{patient_id}.csv"
+        df.to_csv(out_path, index=False)
+        print(f"Saved {len(df)} rows -> {out_path.resolve()}")

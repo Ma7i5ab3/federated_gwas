@@ -138,6 +138,7 @@ def make_figure(freq_df: pd.DataFrame,
         print(f"\n  Plot saved to: {output_path.resolve()}")
 
     plt.show()
+    plt.close()
 
 
 def _draw_manhattan(ax, plot_df, present_chroms, chrom_to_color,
@@ -436,6 +437,7 @@ def make_gene_figure(gene_df: pd.DataFrame,
         print(f"  Gene plot saved to: {output_path.resolve()}")
 
     plt.show()
+    plt.close()
 
 
 def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
@@ -759,6 +761,7 @@ def make_bin_figure(bin_df: pd.DataFrame,
         print(f"  Bin plot saved to: {output_path.resolve()}")
 
     plt.show()
+    plt.close()
 
 
 def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
