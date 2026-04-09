@@ -183,7 +183,13 @@ def _pass1(
                       "worst_impact_rank": "max"})
             )
 
-    gene_agg_df = gene_agg.reset_index() if gene_agg is not None else pd.DataFrame()
+    if gene_agg is not None:
+        gene_agg_df = gene_agg.reset_index()
+    else:
+        gene_agg_df = pd.DataFrame(columns=[
+            "SYMBOL", "CHROM", "patient_count", "variant_count",
+            "gene_start", "gene_end", "worst_impact_rank",
+        ])
     return locus_count, locus_ann, gene_agg_df
 
 

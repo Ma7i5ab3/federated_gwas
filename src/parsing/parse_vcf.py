@@ -151,10 +151,20 @@ def parse_vcf(vcf_path: str | Path, output_path: str | Path,
 
     def _flush(buf: list[dict]) -> None:
         nonlocal writer
-        df    = _reorder_columns(pd.DataFrame(buf))
-        table = pa.Table.from_pandas(df, preserve_index=False)
+        df = _reorder_columns(pd.DataFrame(buf))
         if writer is None:
+            table = pa.Table.from_pandas(df, preserve_index=False)
             writer = pq.ParquetWriter(output_path, table.schema)
+        else:
+            # Align this chunk to the file's established schema:
+            # add missing columns as null, cast to the expected types.
+            file_schema = writer.schema_arrow
+            for field in file_schema:
+                if field.name not in df.columns:
+                    df[field.name] = None
+            # Reorder columns to match the file schema exactly
+            df = df[[f.name for f in file_schema]]
+            table = pa.Table.from_pandas(df, schema=file_schema, preserve_index=False)
         writer.write_table(table)
 
     with vcf_path.open("r") as fh:
