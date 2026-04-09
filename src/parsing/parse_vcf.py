@@ -2,19 +2,45 @@
 parse_vcf.py
 ------------
 Parse VEP-annotated VCF files (Sarek / DeepVariant output) from data/*.vcf
-and produce a tidy pandas DataFrame with one row per variant per patient.
+and produce a Parquet file per patient with one row per variant per transcript.
 
 Columns produced
 ----------------
 Standard VCF fields : Patient_ID, CHROM, POS, ID, REF, ALT, QUAL, FILTER
 VEP CSQ sub-fields  : Allele … gnomADg_AF_sas  (parsed from the INFO/CSQ tag)
 Sample FORMAT fields: GT, GQ, DP, AD, VAF, PL
+
+Memory model
+------------
+Rows are buffered in memory up to CHUNK_SIZE, then flushed to the Parquet file
+via a PyArrow ParquetWriter. Peak memory per file is bounded to
+~CHUNK_SIZE × row_size regardless of VCF size.
 """
 
-import os
 import re
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pathlib import Path
+
+
+CHUNK_SIZE = 10_000  # rows to buffer before flushing to disk
+
+DESIRED_COLUMNS = [
+    "Patient_ID", "CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
+    # VEP CSQ fields
+    "Allele", "Consequence", "IMPACT", "SYMBOL", "Gene", "Feature_type",
+    "Feature", "BIOTYPE", "EXON", "INTRON", "HGVSc", "HGVSp",
+    "cDNA_position", "CDS_position", "Protein_position", "Amino_acids",
+    "Codons", "Existing_variation", "DISTANCE", "STRAND", "FLAGS",
+    "SYMBOL_SOURCE", "HGNC_ID", "SOURCE",
+    "gnomADg", "gnomADg_AF",
+    "gnomADg_AF_afr", "gnomADg_AF_ami", "gnomADg_AF_amr",
+    "gnomADg_AF_asj", "gnomADg_AF_eas", "gnomADg_AF_fin",
+    "gnomADg_AF_nfe", "gnomADg_AF_sas",
+    # FORMAT / sample fields
+    "GT", "GQ", "DP", "AD", "VAF", "PL",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -47,19 +73,16 @@ def _parse_info_csq(info_str: str, csq_fields: list[str]) -> list[dict]:
     Returns a list of dicts (one per transcript).
     Missing values are stored as None.
     """
-    # Pull the raw CSQ value: everything after "CSQ="
     csq_match = re.search(r"CSQ=([^;]+)", info_str)
     if not csq_match:
-        # Variant has no annotation – return one empty record
         return [{f: None for f in csq_fields}]
 
     csq_raw = csq_match.group(1)
-    transcripts = csq_raw.split(",")   # multiple transcripts separated by ","
+    transcripts = csq_raw.split(",")
 
     records = []
     for transcript in transcripts:
         values = transcript.split("|")
-        # Zip with field names; fall back to None if fewer values than fields
         record = {
             field: (values[i] if i < len(values) and values[i] != "" else None)
             for i, field in enumerate(csq_fields)
@@ -88,60 +111,74 @@ def _parse_format_sample(format_str: str, sample_str: str) -> dict:
     return result
 
 
+def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the desired column order to a DataFrame chunk."""
+    ordered = [c for c in DESIRED_COLUMNS if c in df.columns]
+    extra   = [c for c in df.columns if c not in DESIRED_COLUMNS]
+    return df[ordered + extra]
+
+
 # ---------------------------------------------------------------------------
 # Main parser
 # ---------------------------------------------------------------------------
 
-def parse_vcf(vcf_path: str | Path) -> pd.DataFrame:
+def parse_vcf(vcf_path: str | Path, output_path: str | Path,
+              chunk_size: int = CHUNK_SIZE) -> int:
     """
-    Parse a single VCF file and return a DataFrame.
+    Parse a single VCF file and write a Parquet file incrementally.
+
+    Rows are buffered in memory up to *chunk_size*, then flushed to disk.
+    Peak memory is bounded to chunk_size × row_size, not the full file size.
 
     Parameters
     ----------
-    vcf_path : path to the .vcf file
+    vcf_path    : path to the input .vcf file
+    output_path : path for the output .parquet file (overwritten if exists)
+    chunk_size  : number of rows to buffer before flushing (default: 10 000)
 
     Returns
     -------
-    pd.DataFrame with all requested columns.
+    Total number of rows written.
     """
-    vcf_path = Path(vcf_path)
-    patient_id = vcf_path.stem          # filename without extension
+    vcf_path    = Path(vcf_path)
+    output_path = Path(output_path)
+    patient_id  = vcf_path.stem
 
-    csq_fields: list[str] = []          # filled when we find the CSQ header line
-    rows: list[dict] = []
+    csq_fields: list[str] = []
+    buffer: list[dict] = []
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+
+    def _flush(buf: list[dict]) -> None:
+        nonlocal writer
+        df    = _reorder_columns(pd.DataFrame(buf))
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(output_path, table.schema)
+        writer.write_table(table)
 
     with vcf_path.open("r") as fh:
         for line in fh:
             line = line.rstrip("\n")
 
-            # --- Meta-information lines ---
             if line.startswith("##"):
-                # Grab the CSQ field order from the VEP annotation line
                 if "ID=CSQ" in line:
                     csq_fields = _parse_csq_header(line)
                 continue
 
-            # --- Column header line ---
             if line.startswith("#CHROM"):
-                # We don't need sample name from header for now
                 continue
 
-            # --- Data lines ---
             parts = line.split("\t")
             if len(parts) < 9:
-                continue                # skip malformed lines
+                continue
 
             chrom, pos, vid, ref, alt, qual, filt, info, fmt = parts[:9]
             sample = parts[9] if len(parts) > 9 else ""
 
-            # Parse VEP annotations (one dict per transcript)
             csq_records = _parse_info_csq(info, csq_fields)
+            fmt_dict    = _parse_format_sample(fmt, sample)
 
-            # Parse FORMAT/SAMPLE (GT, GQ, DP, AD, VAF, PL)
-            fmt_dict = _parse_format_sample(fmt, sample)
-
-            # Build one output row per CSQ transcript
-            # (with --pick VEP flag there is usually exactly one)
             for csq in csq_records:
                 row = {
                     "Patient_ID": patient_id,
@@ -153,80 +190,67 @@ def parse_vcf(vcf_path: str | Path) -> pd.DataFrame:
                     "QUAL":       qual if qual != "." else None,
                     "FILTER":     filt,
                 }
-                row.update(csq)         # VEP sub-fields
-                row.update(fmt_dict)    # GT, GQ, DP, AD, VAF, PL
-                rows.append(row)
+                row.update(csq)
+                row.update(fmt_dict)
+                buffer.append(row)
 
-    return pd.DataFrame(rows)
+            if len(buffer) >= chunk_size:
+                _flush(buffer)
+                total_rows += len(buffer)
+                buffer.clear()
 
+    # Flush any remaining rows
+    if buffer:
+        _flush(buffer)
+        total_rows += len(buffer)
 
-def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply the desired column order to a DataFrame."""
-    desired_columns = [
-        "Patient_ID", "CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
-        # VEP CSQ fields
-        "Allele", "Consequence", "IMPACT", "SYMBOL", "Gene", "Feature_type",
-        "Feature", "BIOTYPE", "EXON", "INTRON", "HGVSc", "HGVSp",
-        "cDNA_position", "CDS_position", "Protein_position", "Amino_acids",
-        "Codons", "Existing_variation", "DISTANCE", "STRAND", "FLAGS",
-        "SYMBOL_SOURCE", "HGNC_ID", "SOURCE",
-        "gnomADg", "gnomADg_AF",
-        "gnomADg_AF_afr", "gnomADg_AF_ami", "gnomADg_AF_amr",
-        "gnomADg_AF_asj", "gnomADg_AF_eas", "gnomADg_AF_fin",
-        "gnomADg_AF_nfe", "gnomADg_AF_sas",
-        # FORMAT / sample fields
-        "GT", "GQ", "DP", "AD", "VAF", "PL",
-    ]
-    ordered = [c for c in desired_columns if c in df.columns]
-    extra   = [c for c in df.columns if c not in desired_columns]
-    return df[ordered + extra]
+    if writer is not None:
+        writer.close()
 
-
-def parse_all_vcfs(data_dir: str | Path = "data") -> dict[str, pd.DataFrame]:
-    """
-    Parse all .vcf files found in *data_dir* and return one DataFrame per patient.
-
-    Parameters
-    ----------
-    data_dir : directory that contains the .vcf files (default: "data/")
-
-    Returns
-    -------
-    dict mapping patient_id -> pd.DataFrame
-    """
-    data_dir = Path(data_dir)
-    vcf_files = sorted(data_dir.glob("*.vcf"))
-
-    if not vcf_files:
-        raise FileNotFoundError(f"No .vcf files found in {data_dir.resolve()}")
-
-    return {
-        vcf_file.stem: _reorder_columns(parse_vcf(vcf_file))
-        for vcf_file in vcf_files
-    }
+    return total_rows
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def parse_all_vcfs(data_dir: str | Path = "data",
+                   output_dir: str | Path = "output/parsed",
+                   chunk_size: int = CHUNK_SIZE) -> None:
+    """
+    Parse all .vcf files in *data_dir* and write one Parquet file per patient
+    to *output_dir*.
+
+    Patients are processed one at a time; no DataFrames are kept in memory
+    between files.
+
+    Parameters
+    ----------
+    data_dir   : directory containing the .vcf files (default: "data/")
+    output_dir : directory for the output .parquet files
+    chunk_size : rows to buffer per flush (default: CHUNK_SIZE)
+    """
+    data_dir   = Path(data_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    vcf_files = sorted(data_dir.glob("*.vcf"))
+    if not vcf_files:
+        raise FileNotFoundError(f"No .vcf files found in {data_dir.resolve()}")
+
+    for vcf_file in vcf_files:
+        out_path = output_dir / f"{vcf_file.stem}.parquet"
+        print(f"Parsing {vcf_file.name} -> {out_path.name} ...", flush=True)
+        n = parse_vcf(vcf_file, out_path, chunk_size=chunk_size)
+        print(f"  {n:,} rows written.", flush=True)
+
+
 if __name__ == "__main__":
-    # Run from the project root: python src/parse_vcf.py
     parsing_dir = Path(__file__).parent
-    script_dir = parsing_dir.parent
-    data_dir   = script_dir.parent / "data"
-    output_dir = script_dir.parent / "output"
-    output_dir.mkdir(exist_ok=True)
-    parsed_dir = output_dir / "parsed"
-    parsed_dir.mkdir(exist_ok=True)
+    script_dir  = parsing_dir.parent
+    data_dir    = script_dir.parent / "data"
+    output_dir  = script_dir.parent / "output" / "parsed"
 
     print(f"Scanning for VCF files in: {data_dir.resolve()}")
-    patients = parse_all_vcfs(data_dir)
-
-    total_rows = sum(len(df) for df in patients.values())
-    print(f"Parsed {total_rows} variant-transcript rows from {len(patients)} patient(s).")
-
-    for patient_id, df in patients.items():
-        out_path = parsed_dir / f"{patient_id}.csv"
-        df.to_csv(out_path, index=False)
-        print(f"Saved {len(df)} rows -> {out_path.resolve()}")
+    parse_all_vcfs(data_dir, output_dir)
+    print("Done.")

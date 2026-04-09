@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Step 1 — Parse VCF files from /app/data → /app/output/variants.csv
+# Step 1 — Parse VCF files from /app/data → /app/output/parsed/<patient>.parquet
 echo "=== Step 1: Parsing VCF files ==="
 python src/parsing/parse_vcf.py
 

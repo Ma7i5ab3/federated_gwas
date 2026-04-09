@@ -4,7 +4,7 @@ generate_variants.py
 Synthesise realistic VCF-derived variant data for N patients,
 each with M variants distributed across all human chromosomes.
 
-Produces one CSV per patient under output/synthetic_patients/.
+Produces one Parquet file per patient under output/synthetic_patients/.
 
 Usage
 -----
@@ -461,7 +461,7 @@ def generate_patient(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate synthetic VCF-derived variant CSVs for N patients."
+        description="Generate synthetic VCF-derived variant Parquet files for N patients."
     )
     parser.add_argument(
         "-p", "--patients", type=int, required=True,
@@ -494,8 +494,8 @@ def main() -> None:
     for i in range(1, args.patients + 1):
         patient_id = f"PATIENT_{i:04d}"
         df = generate_patient(patient_id, args.variants, rng)
-        out_path = args.output / f"{patient_id}.csv"
-        df.to_csv(out_path, index=False)
+        out_path = args.output / f"{patient_id}.parquet"
+        df.to_parquet(out_path, index=False)
         chrom_counts = df["CHROM"].value_counts().to_dict()
         print(f"  [{i}/{args.patients}] {patient_id}: {len(df)} variants "
               f"across {df['CHROM'].nunique()} chromosomes → {out_path.name}")
