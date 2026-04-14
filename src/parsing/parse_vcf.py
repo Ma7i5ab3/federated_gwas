@@ -158,7 +158,7 @@ def parse_vcf(vcf_path: str | Path, output_path: str | Path,
         else:
             # Align this chunk to the file's established schema:
             # add missing columns as null, cast to the expected types.
-            file_schema = writer.schema_arrow
+            file_schema = writer.schema
             for field in file_schema:
                 if field.name not in df.columns:
                     df[field.name] = None

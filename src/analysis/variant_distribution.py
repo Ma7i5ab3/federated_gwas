@@ -10,9 +10,10 @@ Streams patient Parquet files one at a time to accumulate:
 
 Memory model
 ------------
-Pass 1 reads only ~9 columns per file for locus + gene accumulation.
-Pass 2 reads only ~7 columns per file for bin accumulation, using gene
-boundaries already determined in Pass 1.
+Each Parquet file is read in batches of _BATCH_SIZE rows so that only one
+chunk is in memory at a time.  Per-patient deduplication is maintained via
+lightweight Python sets of tuple keys — these hold only the *variant* rows
+(non-ref calls), which are a small fraction of the raw VCF rows.
 
 The locus accumulator grows with the number of *unique* (CHROM, POS, REF, ALT)
 loci across the cohort — not n_patients × rows_per_patient.
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -59,16 +61,21 @@ _PASS2_COLS = ["SYMBOL", "CHROM", "POS", "REF", "ALT", "IMPACT", "GT"]
 _REF_CALLS      = frozenset({"0/0", "./.", "0|0", ".|."})
 _RANK_TO_IMPACT = {v: k for k, v in IMPACT_RANK.items()}
 
+# Rows read from a Parquet file per iteration — keeps peak RSS manageable.
+_BATCH_SIZE = 100_000
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _read(path: Path, wanted: list[str]) -> pd.DataFrame:
-    """Read only *wanted* columns from a Parquet file, skipping absent ones."""
+def _iter_batches(path: Path, wanted: list[str]) -> Iterator[pd.DataFrame]:
+    """Yield DataFrame chunks of *wanted* columns from a Parquet file."""
     available = set(pq.read_schema(path).names)
     cols = [c for c in wanted if c in available]
-    return pd.read_parquet(path, columns=cols)
+    pf = pq.ParquetFile(path)
+    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=cols):
+        yield batch.to_pandas()
 
 
 def _filter_gt(df: pd.DataFrame) -> pd.DataFrame:
@@ -93,7 +100,7 @@ def _pass1(
     parquet_files: list[Path],
 ) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
     """
-    Stream all patient Parquet files once.
+    Stream all patient Parquet files once, reading _BATCH_SIZE rows at a time.
 
     Returns
     -------
@@ -101,87 +108,118 @@ def _pass1(
                     value = number of patients carrying that locus
     locus_ann     : pd.DataFrame with the same MultiIndex, annotation columns
                     populated from the first patient that carries each locus
-    all_gene_stats: pd.DataFrame with one row per (patient × gene); the caller
-                    reduces this with a single groupby
+    gene_agg_df   : pd.DataFrame with one row per unique (SYMBOL, CHROM)
     """
     locus_count: pd.Series | None    = None
     locus_ann:   pd.DataFrame | None = None
     gene_agg:    pd.DataFrame | None = None
 
     for f in tqdm(parquet_files, desc="  Pass 1/2 – locus + gene", unit="pt"):
-        df = _read(f, _PASS1_COLS)
-        df = _filter_gt(df)
-        if df.empty:
-            continue
+        # Per-patient dedup state (sets of tuple keys for seen variant loci)
+        seen_loci:      set[tuple] = set()
+        seen_gene_loci: set[tuple] = set()
+        # Per-patient gene accumulator: (SYMBOL, CHROM) -> stats dict
+        patient_gene: dict[tuple, dict] = {}
 
-        avail_locus = [c for c in _LOCUS_KEY if c in df.columns]
-        avail_ann   = [c for c in _ANN_COLS  if c in df.columns]
+        avail_locus: list[str] = []
+        avail_ann:   list[str] = []
 
-        # ---- Locus accumulation (vectorised Series.add) ------------------
-        patient_loci = df.drop_duplicates(subset=avail_locus)
-        new_idx      = pd.MultiIndex.from_frame(patient_loci[avail_locus])
-        new_counts   = pd.Series(1, index=new_idx, dtype="int32")
+        for df in _iter_batches(f, _PASS1_COLS):
+            df = _filter_gt(df)
+            if df.empty:
+                continue
 
-        if locus_count is None:
-            locus_count = new_counts.rename("patient_count")
-            locus_ann   = patient_loci[avail_locus + avail_ann].set_index(avail_locus)
-        else:
-            locus_count = locus_count.add(new_counts, fill_value=0).astype("int32")
-            truly_new   = new_counts.index.difference(locus_ann.index)
-            if len(truly_new):
-                new_ann   = patient_loci[avail_locus + avail_ann].set_index(avail_locus)
-                locus_ann = pd.concat([locus_ann, new_ann.loc[new_ann.index.isin(truly_new)]])
+            if not avail_locus:
+                avail_locus = [c for c in _LOCUS_KEY if c in df.columns]
+                avail_ann   = [c for c in _ANN_COLS  if c in df.columns]
 
-        # ---- Gene stats for this patient ---------------------------------
-        if "SYMBOL" not in df.columns:
-            continue
+            # ---- Locus accumulation: deduplicate within this patient ------
+            loci_tuples = list(zip(*(df[c] for c in avail_locus)))
+            new_mask    = [t not in seen_loci for t in loci_tuples]
+            seen_loci.update(t for t, m in zip(loci_tuples, new_mask) if m)
 
-        g = df.dropna(subset=["SYMBOL"])
-        g = g[g["SYMBOL"].astype(str).str.strip() != ""]
-        g = _prep_pos(g)
-        if g.empty:
-            continue
+            new_loci_df = df.loc[[i for i, m in zip(df.index, new_mask) if m]]
+            if not new_loci_df.empty:
+                new_idx    = pd.MultiIndex.from_frame(new_loci_df[avail_locus])
+                new_counts = pd.Series(1, index=new_idx, dtype="int32")
+                if locus_count is None:
+                    locus_count = new_counts.rename("patient_count")
+                    locus_ann   = new_loci_df[avail_locus + avail_ann].set_index(avail_locus)
+                else:
+                    locus_count = locus_count.add(new_counts, fill_value=0).astype("int32")
+                    truly_new   = new_counts.index.difference(locus_ann.index)
+                    if len(truly_new):
+                        new_ann   = new_loci_df[avail_locus + avail_ann].set_index(avail_locus)
+                        locus_ann = pd.concat(
+                            [locus_ann, new_ann.loc[new_ann.index.isin(truly_new)]]
+                        )
 
-        dedup_cols  = ["SYMBOL", "CHROM", "POS"] + [c for c in ["REF", "ALT"] if c in g.columns]
-        locus_dedup = g.drop_duplicates(subset=dedup_cols)
+            # ---- Gene stats for this patient / batch ---------------------
+            if "SYMBOL" not in df.columns:
+                continue
 
-        gene_stats = (
-            locus_dedup
-            .groupby(["SYMBOL", "CHROM"], sort=False)
-            .agg(variant_count=("POS", "count"),
-                 gene_start    =("POS", "min"),
-                 gene_end      =("POS", "max"))
-            .reset_index()
-        )
-        gene_stats["patient_count"] = 1  # one patient per frame
+            g = df.dropna(subset=["SYMBOL"])
+            g = g[g["SYMBOL"].astype(str).str.strip() != ""]
+            g = _prep_pos(g)
+            if g.empty:
+                continue
 
-        if "IMPACT" in g.columns:
-            # Vectorised: map string → rank, then groupby max
-            g = g.copy()
-            g["_rank"] = g["IMPACT"].map(IMPACT_RANK).fillna(0).astype("int8")
-            impact_df  = (
-                g.groupby(["SYMBOL", "CHROM"], sort=False)["_rank"]
-                .max()
-                .reset_index(name="worst_impact_rank")
-            )
-            gene_stats = gene_stats.merge(impact_df, on=["SYMBOL", "CHROM"], how="left")
-            gene_stats["worst_impact_rank"] = gene_stats["worst_impact_rank"].fillna(0).astype("int8")
-        else:
-            gene_stats["worst_impact_rank"] = 0
+            if "IMPACT" in g.columns:
+                g = g.copy()
+                g["_rank"] = g["IMPACT"].map(IMPACT_RANK).fillna(0).astype("int8")
+            else:
+                g = g.assign(_rank=0)
 
-        gs = gene_stats.set_index(["SYMBOL", "CHROM"])
-        if gene_agg is None:
-            gene_agg = gs
-        else:
-            gene_agg = (
-                pd.concat([gene_agg, gs])
-                .groupby(level=["SYMBOL", "CHROM"], sort=False)
-                .agg({"patient_count":     "sum",
-                      "variant_count":     "sum",
-                      "gene_start":        "min",
-                      "gene_end":          "max",
-                      "worst_impact_rank": "max"})
-            )
+            dedup_cols     = ["SYMBOL", "CHROM", "POS"] + [c for c in ["REF", "ALT"] if c in g.columns]
+            gene_loci_keys = list(zip(*(g[c] for c in dedup_cols)))
+            new_gene_mask  = [t not in seen_gene_loci for t in gene_loci_keys]
+            seen_gene_loci.update(t for t, m in zip(gene_loci_keys, new_gene_mask) if m)
+
+            ng = g.loc[[i for i, m in zip(g.index, new_gene_mask) if m]]
+            if ng.empty:
+                continue
+
+            for (symbol, chrom), grp in ng.groupby(["SYMBOL", "CHROM"], sort=False):
+                key = (symbol, chrom)
+                vc  = len(grp)
+                gs_val = int(grp["POS"].min())
+                ge_val = int(grp["POS"].max())
+                ir     = int(grp["_rank"].max())
+                if key not in patient_gene:
+                    patient_gene[key] = {
+                        "variant_count":     vc,
+                        "gene_start":        gs_val,
+                        "gene_end":          ge_val,
+                        "worst_impact_rank": ir,
+                    }
+                else:
+                    s = patient_gene[key]
+                    s["variant_count"]     += vc
+                    s["gene_start"]         = min(s["gene_start"], gs_val)
+                    s["gene_end"]           = max(s["gene_end"],   ge_val)
+                    s["worst_impact_rank"]  = max(s["worst_impact_rank"], ir)
+
+        # Merge this patient's gene stats into the global accumulator
+        if patient_gene:
+            records = [
+                {"SYMBOL": sym, "CHROM": chrom, "patient_count": 1, **stats}
+                for (sym, chrom), stats in patient_gene.items()
+            ]
+            gs_df = pd.DataFrame(records).set_index(["SYMBOL", "CHROM"])
+            if gene_agg is None:
+                gene_agg = gs_df
+            else:
+                gene_agg = (
+                    pd.concat([gene_agg, gs_df])
+                    .groupby(level=["SYMBOL", "CHROM"], sort=False)
+                    .agg({
+                        "patient_count":     "sum",
+                        "variant_count":     "sum",
+                        "gene_start":        "min",
+                        "gene_end":          "max",
+                        "worst_impact_rank": "max",
+                    })
+                )
 
     if gene_agg is not None:
         gene_agg_df = gene_agg.reset_index()
@@ -205,7 +243,8 @@ def _pass2(
     overlap:        int,
 ) -> pd.DataFrame:
     """
-    Stream all patient Parquet files a second time, computing per-bin stats.
+    Stream all patient Parquet files a second time, reading _BATCH_SIZE rows
+    at a time and computing per-bin stats.
 
     Gene boundaries from Pass 1 enable fully vectorised bin assignment for
     the no-overlap case and a fast list-comprehension explode for overlap > 0.
@@ -214,88 +253,109 @@ def _pass2(
     step    = bin_length - overlap
     bin_agg: pd.DataFrame | None = None
 
+    _BIN_IDX = ["SYMBOL", "CHROM", "bin_id", "bin_start", "bin_end"]
+
     for f in tqdm(parquet_files, desc="  Pass 2/2 – bins      ", unit="pt"):
-        df = _read(f, _PASS2_COLS)
-        df = _filter_gt(df)
-        if df.empty or "SYMBOL" not in df.columns:
-            continue
+        # Per-patient dedup state
+        seen_loci: set[tuple] = set()
+        # Per-patient bin accumulator (no patient_count yet)
+        patient_bin: pd.DataFrame | None = None
 
-        g = df.dropna(subset=["SYMBOL"])
-        g = g[g["SYMBOL"].astype(str).str.strip() != ""]
-        g = _prep_pos(g)
-        if g.empty:
-            continue
+        for df in _iter_batches(f, _PASS2_COLS):
+            df = _filter_gt(df)
+            if df.empty or "SYMBOL" not in df.columns:
+                continue
 
-        # Deduplicate to unique loci for this patient
-        dedup_cols = ["SYMBOL", "CHROM", "POS"] + [c for c in ["REF", "ALT"] if c in g.columns]
-        g = g.drop_duplicates(subset=dedup_cols).copy()
+            g = df.dropna(subset=["SYMBOL"])
+            g = g[g["SYMBOL"].astype(str).str.strip() != ""]
+            g = _prep_pos(g)
+            if g.empty:
+                continue
 
-        # Vectorised IMPACT → rank
-        g["_rank"] = (
-            g["IMPACT"].map(IMPACT_RANK).fillna(0).astype("int8")
-            if "IMPACT" in g.columns else 0
-        )
+            # Deduplicate to unique loci for this patient (across batches)
+            dedup_cols     = ["SYMBOL", "CHROM", "POS"] + [c for c in ["REF", "ALT"] if c in g.columns]
+            loci_tuples    = list(zip(*(g[c] for c in dedup_cols)))
+            new_mask       = [t not in seen_loci for t in loci_tuples]
+            seen_loci.update(t for t, m in zip(loci_tuples, new_mask) if m)
 
-        # Join gene boundaries; discard loci outside observed gene span
-        g = g.merge(gene_bounds_df[["SYMBOL", "CHROM", "gene_start", "gene_end"]],
-                    on=["SYMBOL", "CHROM"], how="inner")
-        g = g[(g["POS"] >= g["gene_start"]) & (g["POS"] <= g["gene_end"])]
-        if g.empty:
-            continue
+            g = g.loc[[i for i, m in zip(g.index, new_mask) if m]].copy()
+            if g.empty:
+                continue
 
-        if overlap == 0:
-            # ---- Fast path: one bin per locus, fully vectorised ----------
-            g["bin_id"]    = (g["POS"] - g["gene_start"]) // bin_length
-            g["bin_start"] = g["gene_start"] + g["bin_id"] * bin_length
-            g["bin_end"]   = (g["bin_start"] + bin_length - 1).clip(upper=g["gene_end"])
-
-            bin_stats = (
-                g.groupby(["SYMBOL", "CHROM", "bin_id", "bin_start", "bin_end"], sort=False)
-                .agg(variant_count    =("POS",   "count"),
-                     worst_impact_rank=("_rank", "max"))
-                .reset_index()
+            # Vectorised IMPACT → rank
+            g["_rank"] = (
+                g["IMPACT"].map(IMPACT_RANK).fillna(0).astype("int8")
+                if "IMPACT" in g.columns else 0
             )
 
-        else:
-            # ---- Overlap path: each locus may belong to multiple bins ----
-            # b_max = last bin index containing POS
-            # b_min = first bin index containing POS (ceiling division via
-            #         the identity  ceil(a/b) = -(−a // b)  for integer b > 0)
-            g["b_max"] = (g["POS"] - g["gene_start"]) // step
-            g["b_min"] = (
-                -((g["gene_start"] + bin_length - 1 - g["POS"]) // step)
-            ).clip(lower=0)
+            # Join gene boundaries; discard loci outside observed gene span
+            g = g.merge(gene_bounds_df[["SYMBOL", "CHROM", "gene_start", "gene_end"]],
+                        on=["SYMBOL", "CHROM"], how="inner")
+            g = g[(g["POS"] >= g["gene_start"]) & (g["POS"] <= g["gene_end"])]
+            if g.empty:
+                continue
 
-            # Explode bin index range per row (list-comprehension, no apply)
-            g["bin_ids"] = [
-                list(range(lo, hi + 1))
-                for lo, hi in zip(g["b_min"], g["b_max"])
-            ]
-            g = g.explode("bin_ids").rename(columns={"bin_ids": "bin_id"})
-            g["bin_id"]    = g["bin_id"].astype(int)
-            g["bin_start"] = g["gene_start"] + g["bin_id"] * step
-            g["bin_end"]   = (g["bin_start"] + bin_length - 1).clip(upper=g["gene_end"])
-            g = g[g["bin_start"] <= g["gene_end"]]  # drop out-of-gene bins
+            if overlap == 0:
+                # ---- Fast path: one bin per locus, fully vectorised ------
+                g["bin_id"]    = (g["POS"] - g["gene_start"]) // bin_length
+                g["bin_start"] = g["gene_start"] + g["bin_id"] * bin_length
+                g["bin_end"]   = (g["bin_start"] + bin_length - 1).clip(upper=g["gene_end"])
 
-            bin_stats = (
-                g.groupby(["SYMBOL", "CHROM", "bin_id", "bin_start", "bin_end"], sort=False)
-                .agg(variant_count    =("POS",   "count"),
-                     worst_impact_rank=("_rank", "max"))
-                .reset_index()
-            )
+                bin_stats = (
+                    g.groupby(_BIN_IDX, sort=False)
+                    .agg(variant_count    =("POS",   "count"),
+                         worst_impact_rank=("_rank", "max"))
+                    .reset_index()
+                )
 
-        bin_stats["patient_count"] = 1
-        bs = bin_stats.set_index(["SYMBOL", "CHROM", "bin_id", "bin_start", "bin_end"])
-        if bin_agg is None:
-            bin_agg = bs
-        else:
-            bin_agg = (
-                pd.concat([bin_agg, bs])
-                .groupby(level=["SYMBOL", "CHROM", "bin_id", "bin_start", "bin_end"], sort=False)
-                .agg({"patient_count":     "sum",
-                      "variant_count":     "sum",
-                      "worst_impact_rank": "max"})
-            )
+            else:
+                # ---- Overlap path: each locus may belong to multiple bins
+                g["b_max"] = (g["POS"] - g["gene_start"]) // step
+                g["b_min"] = (
+                    -((g["gene_start"] + bin_length - 1 - g["POS"]) // step)
+                ).clip(lower=0)
+
+                g["bin_ids"] = [
+                    list(range(lo, hi + 1))
+                    for lo, hi in zip(g["b_min"], g["b_max"])
+                ]
+                g = g.explode("bin_ids").rename(columns={"bin_ids": "bin_id"})
+                g["bin_id"]    = g["bin_id"].astype(int)
+                g["bin_start"] = g["gene_start"] + g["bin_id"] * step
+                g["bin_end"]   = (g["bin_start"] + bin_length - 1).clip(upper=g["gene_end"])
+                g = g[g["bin_start"] <= g["gene_end"]]
+
+                bin_stats = (
+                    g.groupby(_BIN_IDX, sort=False)
+                    .agg(variant_count    =("POS",   "count"),
+                         worst_impact_rank=("_rank", "max"))
+                    .reset_index()
+                )
+
+            bs = bin_stats.set_index(_BIN_IDX)
+            if patient_bin is None:
+                patient_bin = bs
+            else:
+                patient_bin = (
+                    pd.concat([patient_bin, bs])
+                    .groupby(level=_BIN_IDX, sort=False)
+                    .agg({"variant_count": "sum", "worst_impact_rank": "max"})
+                )
+
+        # Merge this patient's bins into the global accumulator
+        if patient_bin is not None:
+            patient_bin = patient_bin.copy()
+            patient_bin["patient_count"] = 1
+            if bin_agg is None:
+                bin_agg = patient_bin
+            else:
+                bin_agg = (
+                    pd.concat([bin_agg, patient_bin])
+                    .groupby(level=_BIN_IDX, sort=False)
+                    .agg({"patient_count":     "sum",
+                          "variant_count":     "sum",
+                          "worst_impact_rank": "max"})
+                )
 
     if bin_agg is None:
         return pd.DataFrame()
