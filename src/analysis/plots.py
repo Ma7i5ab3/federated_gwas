@@ -16,8 +16,6 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
 from matplotlib.ticker import FuncFormatter
 
 # ---------------------------------------------------------------------------
@@ -278,31 +276,20 @@ def _draw_top_variants(ax, freq_df, top_n, n_patients):
     x_max = freq_df["frequency"].max()
     label_offset = x_max * 0.02
     for bar, (_, row) in zip(bars, top.iterrows()):
-        pct = f"{row['frequency']:.1%}  ({int(row['patient_count'])}/{n_patients})"
+        lbl = f"{row['frequency']:.2e}  ({int(row['patient_count'])}/{n_patients})"
         ax.text(
             bar.get_width() + label_offset, bar.get_y() + bar.get_height() / 2,
-            pct, va="center", ha="left", fontsize=7.5, color="#333333",
+            lbl, va="center", ha="left", fontsize=7.5, color="#333333",
         )
 
     ax.set_facecolor("#FFFFFF")
-    ax.set_xlabel("Mutation Frequency", fontsize=10, color="#333333")
-    ax.set_title(f"Top {top_n} Most Frequent Variants", fontsize=12,
+    ax.set_xlabel("Mutation Coverage (variants / (length × patients))", fontsize=10, color="#333333")
+    ax.set_title(f"Top {top_n} Most Covered Variants", fontsize=12,
                  fontweight="bold", color="#1C1C1C", pad=10)
 
     x_max = top["frequency"].max()
-    ax.set_xlim(0, min(x_max * 1.30, 1.0))
-
-    # Choose decimal precision so ticks never collapse into duplicate labels
-    if x_max < 0.01:
-        decimals = 3
-    elif x_max < 0.10:
-        decimals = 2
-    elif x_max < 0.50:
-        decimals = 1
-    else:
-        decimals = 0
-    fmt_str = f"{{:.{decimals}%}}"
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: fmt_str.format(x)))
+    ax.set_xlim(0, x_max * 1.30)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.2e}"))
     # Cap at 6 ticks so they never crowd or repeat
     ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both"))
 
@@ -388,13 +375,13 @@ def make_gene_figure(gene_df: pd.DataFrame,
                      offsets: dict[str, int],
                      n_patients: int,
                      top_n: int = 20,
-                     min_freq: float = 0.0,
+                     min_density: float = 0.0,
                      output_path: Path | None = None) -> None:
     """
     Three-panel gene-level figure:
-      Panel A  – Gene Manhattan (one dot per gene, y = cohort frequency)
+      Panel A  – Gene Manhattan (one dot per gene, y = log10(density), color = worst impact)
       Panel B  – Top-N most affected genes (horizontal bar, coloured by worst impact)
-      Panel C  – Bubble chart: variant count per gene vs gene frequency
+      Panel C  – Bubble chart: variant count per gene vs gene density
     """
     if gene_df.empty:
         print("  [WARN] Gene dataframe is empty – skipping gene figure.")
@@ -404,7 +391,7 @@ def make_gene_figure(gene_df: pd.DataFrame,
     chrom_to_color = {c: CHROM_PALETTE[i % len(CHROM_PALETTE)]
                       for i, c in enumerate(present_chroms)}
 
-    plot_df = gene_df[gene_df["frequency"] >= min_freq].copy() if min_freq > 0 else gene_df.copy()
+    plot_df = gene_df[gene_df["density"] >= min_density].copy() if min_density > 0 else gene_df.copy()
 
     fig = plt.figure(figsize=(22, 16), facecolor="#F8F9FA")
     fig.suptitle(
@@ -445,8 +432,8 @@ def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
     """
     Gene-level Manhattan:
       - x     : rank-based position within each chromosome (equal spacing, no overlap)
-      - y     : normalized_density auto-scaled to variants/Mb/patient or variants/kb/patient
-      - color : continuous colormap (plasma) encoding 1/allele_frequency (rarer = brighter)
+      - y     : log10(density)  where density = variant_count / (gene_length × n_patients)
+      - color : worst VEP impact level (HIGH/MODERATE/LOW/MODIFIER)
       - size  : uniform
     """
 
@@ -455,13 +442,11 @@ def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
         spine.set_color("#CCCCCC")
     ax.tick_params(colors="#555555")
 
-    y_col = "normalized_density" if "normalized_density" in plot_df.columns else "frequency"
     plot_df = plot_df.copy()
 
-    # --- rank-based x: each gene gets an integer slot, sorted by gene_start ----
-    # This guarantees equal spacing so no two genes ever overlap visually.
+    # --- rank-based x: each gene gets an integer slot, sorted by POS -----
     ordered_chroms = [c for c in CHROM_ORDER if c in plot_df["CHROM"].values]
-    gap = max(4, len(plot_df) // 40)   # adaptive gap between chromosomes
+    gap = max(4, len(plot_df) // 40)
     rank_x: dict[int, int] = {}
     chrom_bounds: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -475,7 +460,10 @@ def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
         cursor += len(sub) + gap
     plot_df["rank_x"] = pd.Series(rank_x)
 
-    # --- alternating chromosome bands (visual separation) -----------------
+    # --- log10 y-values (density is always > 0 after variant filtering) --
+    y_vals = np.log10(plot_df["density"].clip(lower=1e-15))
+
+    # --- alternating chromosome bands ------------------------------------
     for i, chrom in enumerate(ordered_chroms):
         if chrom not in chrom_bounds:
             continue
@@ -484,59 +472,32 @@ def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
                    color="#F0F4F8" if i % 2 == 0 else "#FFFFFF",
                    zorder=0, alpha=0.7)
 
-    # --- auto-scale y to a readable unit ----------------------------------
-    y_median = plot_df[y_col].median()
-    if y_median < 1e-4:
-        scale, unit = 1e6, "Mb"
-    elif y_median < 0.1:
-        scale, unit = 1e3, "kb"
-    else:
-        scale, unit = 1.0, "bp"
-    y_scaled = plot_df[y_col] * scale
+    # --- scatter: color = worst impact -----------------------------------
+    for impact in ["MODIFIER", "LOW", "MODERATE", "HIGH"]:
+        mask = plot_df["worst_impact"] == impact if "worst_impact" in plot_df.columns else pd.Series(True, index=plot_df.index)
+        sub  = plot_df[mask]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["rank_x"].values, y_vals[mask].values,
+            c=IMPACT_COLORS.get(impact, "#95A5A6"),
+            s=35, alpha=0.85, linewidths=0.3, edgecolors="white",
+            label=impact, zorder=2, rasterized=True,
+        )
 
-    # --- colormap: inverse allele frequency (rarer gene = brighter color) -
-    min_af = 1.0 / n_patients
-    inv_af = 1.0 / plot_df["frequency"].clip(lower=min_af)
-    # Cap at 95th percentile so a few extreme outliers don't compress the palette
-    v_lo, v_hi = inv_af.min(), inv_af.quantile(0.95)
-    if v_hi <= v_lo:
-        v_hi = v_lo + 1
-    af_norm = Normalize(vmin=v_lo, vmax=v_hi, clip=True)
-    cmap = plt.cm.plasma
-    dot_colors = cmap(af_norm(inv_af.values))
-
-    # --- scatter (uniform size, color = inv AF) ---------------------------
-    ax.scatter(
-        plot_df["rank_x"].values, y_scaled.values,
-        c=dot_colors, s=35, alpha=0.85,
-        linewidths=0.3, edgecolors="white",
-        zorder=2, rasterized=True,
-    )
-
-    # --- colorbar for the inv-AF scale ------------------------------------
-    sm = ScalarMappable(cmap=cmap, norm=af_norm)
-    sm.set_array([])
-    cbar = ax.get_figure().colorbar(sm, ax=ax, fraction=0.018, pad=0.01, aspect=30)
-    # Tick labels: show as "1/x" so the reader sees actual AF denominator
-    cbar_ticks = np.linspace(v_lo, v_hi, 5)
-    cbar.set_ticks(cbar_ticks)
-    cbar.set_ticklabels([f"1/{t:.0f}" if t >= 2 else f"{1/t:.2f}" for t in cbar_ticks])
-    cbar.set_label("Allele frequency  (1/AF, rarer →)", fontsize=8, color="#555555")
-    cbar.ax.tick_params(labelsize=7, colors="#555555")
-
-    # --- annotate top-N genes by (scaled) density -------------------------
-    top = plot_df.nlargest(top_n, y_col)
+    # --- annotate top-N genes by density ---------------------------------
+    top = plot_df.nlargest(top_n, "density")
     used: list[tuple[float, float]] = []
-    y_max_val = y_scaled.max()
+    y_max_val = y_vals.max()
     for _, row in top.iterrows():
         label      = str(row.get("SYMBOL", "")) or "?"
         impact     = str(row.get("worst_impact", ""))
         font_color = IMPACT_COLORS.get(impact, "#333333")
-        y_val      = row[y_col] * scale
+        y_val      = np.log10(max(row["density"], 1e-15))
 
         y_offset = 14
         for px, py in used:
-            if abs(row["rank_x"] - px) < gap * 3 and abs(y_val - py) < y_max_val * 0.05:
+            if abs(row["rank_x"] - px) < gap * 3 and abs(y_val - py) < abs(y_max_val) * 0.04:
                 y_offset += 12
         used.append((row["rank_x"], y_val))
 
@@ -550,21 +511,24 @@ def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
             zorder=5,
         )
 
-    # --- dynamic y-axis ---------------------------------------------------
-    y_max   = y_scaled.max()
-    y_ceil  = y_max * 1.35
-    y_floor = -y_max * 0.05
-    ref_levels = np.linspace(0, y_max, 6)[1:]
+    # --- y-axis: log10 scale with scientific-notation reference lines ----
+    y_min   = y_vals.min()
+    y_max   = y_vals.max()
+    y_range = y_max - y_min
+    y_ceil  = y_max + y_range * 0.20
+    y_floor = y_min - y_range * 0.05
+
+    ref_levels = np.linspace(y_min, y_max, 6)[1:]
     x_right = plot_df["rank_x"].max()
     for level in ref_levels:
         ax.axhline(level, color="#DDDDDD", linewidth=0.8, linestyle="--", zorder=1)
-        ax.text(x_right * 1.001, level, f"{level:.2f}",
+        ax.text(x_right * 1.001, level, f"10^{level:.1f}",
                 va="center", fontsize=7.5, color="#888888")
 
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"$10^{{{y:.1f}}}$"))
     ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both"))
 
-    # --- chromosome x-ticks (midpoint of each chromosome band) -----------
+    # --- chromosome x-ticks ----------------------------------------------
     xtick_pos, xtick_lab = [], []
     for chrom in ordered_chroms:
         if chrom not in chrom_bounds:
@@ -580,28 +544,26 @@ def _draw_gene_manhattan(ax, plot_df, present_chroms, chrom_to_color,
 
     ax.set_xlabel("Chromosome  (genes ordered by genomic position within each chromosome)",
                   fontsize=11, color="#333333", labelpad=8)
-    ax.set_ylabel(f"Mutation Density\n(variants / {unit} / patient)",
+    ax.set_ylabel("log₁₀  Density\n(variant_count / gene_length / n_patients)",
                   fontsize=11, color="#333333")
     ax.set_title(
         f"Gene-Level Variant Density  ·  Cohort: {n_patients} patients  ·  "
-        f"Genes shown: {len(plot_df):,}  ·  "
-        "color = 1/AF (rarer genes brighter)  ·  label color = worst impact",
+        f"Genes shown: {len(plot_df):,}  ·  color & label = worst VEP impact",
         fontsize=11, color="#555555", pad=8,
     )
 
-    # Small legend for impact colors (annotation labels only)
     legend_handles = [
-        mpatches.Patch(color=IMPACT_COLORS[k], label=f"{k}")
+        mpatches.Patch(color=IMPACT_COLORS[k], label=k)
         for k in ["HIGH", "MODERATE", "LOW", "MODIFIER"]
     ]
     ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
-              framealpha=0.9, title="Label color = worst impact", title_fontsize=8.5)
+              framealpha=0.9, title="Worst VEP Impact", title_fontsize=8.5)
 
 
 def _draw_top_genes(ax, gene_df, top_n, n_patients):
-    """Horizontal bar chart of top-N genes by normalized mutation density."""
+    """Horizontal bar chart of top-N genes by mutation density."""
 
-    sort_col = "normalized_density" if "normalized_density" in gene_df.columns else "frequency"
+    sort_col = "density"
     top = gene_df.nlargest(top_n, sort_col).sort_values(sort_col)
     impact_col = "worst_impact" if "worst_impact" in top.columns else None
     colors = (
@@ -625,7 +587,7 @@ def _draw_top_genes(ax, gene_df, top_n, n_patients):
                 label, va="center", ha="left", fontsize=7, color="#333333")
 
     ax.set_facecolor("#FFFFFF")
-    ax.set_xlabel("Mutation Density (variants / base / patient)", fontsize=10, color="#333333")
+    ax.set_xlabel("Density  (variant_count / gene_length / n_patients)", fontsize=10, color="#333333")
     ax.set_title(f"Top {top_n} Genes by Mutation Density", fontsize=12,
                  fontweight="bold", color="#1C1C1C", pad=10)
 
@@ -655,7 +617,7 @@ def _draw_gene_bubble(ax, gene_df, top_n):
                 ha="center", va="center", transform=ax.transAxes)
         return
 
-    df = gene_df.dropna(subset=["variant_count", "frequency"]).copy()
+    df = gene_df.dropna(subset=["variant_count", "density"]).copy()
     impact_col = "worst_impact" if "worst_impact" in df.columns else None
 
     for impact in ["MODIFIER", "LOW", "MODERATE", "HIGH"]:
@@ -663,33 +625,30 @@ def _draw_gene_bubble(ax, gene_df, top_n):
         if sub.empty:
             continue
         ax.scatter(
-            sub["variant_count"], sub["frequency"],
+            sub["variant_count"], sub["density"],
             c=IMPACT_COLORS.get(impact, "#95A5A6"),
-            s=40 + sub["frequency"] / df["frequency"].max() * 180,
+            s=40 + sub["density"] / df["density"].max() * 180,
             alpha=0.65, linewidths=0.3, edgecolors="white",
             label=impact, zorder=2, rasterized=True,
         )
 
     # Annotate top genes
-    top = df.nlargest(top_n, "frequency")
+    top = df.nlargest(top_n, "density")
     for _, row in top.iterrows():
         ax.annotate(
             str(row["SYMBOL"]),
-            xy=(row["variant_count"], row["frequency"]),
+            xy=(row["variant_count"], row["density"]),
             xytext=(5, 3), textcoords="offset points",
             fontsize=7, color="#333333", zorder=5,
         )
 
     ax.set_facecolor("#FFFFFF")
     ax.set_xlabel("Number of Distinct Variant Loci in Gene", fontsize=10, color="#333333")
-    ax.set_ylabel("Gene Mutation Frequency", fontsize=10, color="#333333")
-    ax.set_title("Variant Richness vs Gene Frequency", fontsize=12,
+    ax.set_ylabel("Density  (variant_count / gene_length / n_patients)", fontsize=10, color="#333333")
+    ax.set_title("Variant Richness vs Gene Density", fontsize=12,
                  fontweight="bold", color="#1C1C1C", pad=10)
 
-    y_max = df["frequency"].max()
-    decimals = 2 if y_max < 0.10 else (1 if y_max < 0.50 else 0)
-    fmt = f"{{:.{decimals}%}}"
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: fmt.format(y)))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2e}"))
     ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both"))
     ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both", integer=True))
     for spine in ["top", "right"]:
@@ -708,13 +667,13 @@ def make_bin_figure(bin_df: pd.DataFrame,
                     bin_length: int,
                     overlap: int = 0,
                     top_n: int = 20,
-                    min_freq: float = 0.0,
+                    min_density: float = 0.0,
                     output_path: Path | None = None) -> None:
     """
     Three-panel bin-level figure:
-      Panel A  – Bin Manhattan (one dot per bin, y = normalized_density)
+      Panel A  – Bin Manhattan (one dot per bin, y = log10(density), color = worst impact)
       Panel B  – Top-N bins by mutation density (horizontal bar)
-      Panel C  – Bubble chart: variant count per bin vs bin frequency
+      Panel C  – Bubble chart: variant count per bin vs bin density
     """
     if bin_df.empty:
         print("  [WARN] Bin dataframe is empty – skipping bin figure.")
@@ -724,7 +683,7 @@ def make_bin_figure(bin_df: pd.DataFrame,
     chrom_to_color = {c: CHROM_PALETTE[i % len(CHROM_PALETTE)]
                       for i, c in enumerate(present_chroms)}
 
-    plot_df = bin_df[bin_df["frequency"] >= min_freq].copy() if min_freq > 0 else bin_df.copy()
+    plot_df = bin_df[bin_df["density"] >= min_density].copy() if min_density > 0 else bin_df.copy()
 
     step = bin_length - overlap
     title_detail = (f"bin={bin_length:,} bp"
@@ -769,8 +728,8 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
     """
     Bin-level Manhattan:
       - x     : rank-based position within each chromosome (equal spacing)
-      - y     : normalized_density, auto-scaled to /Mb, /kb, or /bp per patient
-      - color : plasma colormap encoding 1/frequency (rarer bins = brighter)
+      - y     : log10(density)  where density = variant_count / (bin_length × n_patients)
+      - color : worst VEP impact level (HIGH/MODERATE/LOW/MODIFIER)
       - size  : uniform
     Annotations use the short form  SYMBOL[binN].
     """
@@ -779,18 +738,18 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
         spine.set_color("#CCCCCC")
     ax.tick_params(colors="#555555")
 
-    y_col = "normalized_density" if "normalized_density" in plot_df.columns else "frequency"
     plot_df = plot_df.copy()
 
-    # --- rank-based x: one integer slot per bin, sorted by bin_start within each chrom ---
+    # --- rank-based x: one integer slot per bin, sorted by bin_start -----
     ordered_chroms = [c for c in CHROM_ORDER if c in plot_df["CHROM"].values]
     gap = max(4, len(plot_df) // 80)
     rank_x: dict[int, int] = {}
     chrom_bounds: dict[str, tuple[int, int]] = {}
     cursor = 0
     for chrom in ordered_chroms:
-        sub = plot_df[plot_df["CHROM"] == chrom].sort_values("bin_start"
-              if "bin_start" in plot_df.columns else "POS")
+        sub = plot_df[plot_df["CHROM"] == chrom].sort_values(
+            "bin_start" if "bin_start" in plot_df.columns else "POS"
+        )
         if sub.empty:
             continue
         for rank, idx in enumerate(sub.index):
@@ -799,7 +758,10 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
         cursor += len(sub) + gap
     plot_df["rank_x"] = pd.Series(rank_x)
 
-    # --- alternating chromosome bands ---
+    # --- log10 y-values --------------------------------------------------
+    y_vals = np.log10(plot_df["density"].clip(lower=1e-15))
+
+    # --- alternating chromosome bands ------------------------------------
     for i, chrom in enumerate(ordered_chroms):
         if chrom not in chrom_bounds:
             continue
@@ -808,58 +770,34 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
                    color="#F0F4F8" if i % 2 == 0 else "#FFFFFF",
                    zorder=0, alpha=0.7)
 
-    # --- auto-scale y ---
-    y_median = plot_df[y_col].median()
-    if y_median < 1e-4:
-        scale, unit = 1e6, "Mb"
-    elif y_median < 0.1:
-        scale, unit = 1e3, "kb"
-    else:
-        scale, unit = 1.0, "bp"
-    y_scaled = plot_df[y_col] * scale
+    # --- scatter: color = worst impact -----------------------------------
+    for impact in ["MODIFIER", "LOW", "MODERATE", "HIGH"]:
+        mask = plot_df["worst_impact"] == impact if "worst_impact" in plot_df.columns else pd.Series(True, index=plot_df.index)
+        sub  = plot_df[mask]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["rank_x"].values, y_vals[mask].values,
+            c=IMPACT_COLORS.get(impact, "#95A5A6"),
+            s=20, alpha=0.85, linewidths=0.3, edgecolors="white",
+            label=impact, zorder=2, rasterized=True,
+        )
 
-    # --- colormap: inverse frequency ---
-    min_af   = 1.0 / n_patients
-    inv_af   = 1.0 / plot_df["frequency"].clip(lower=min_af)
-    v_lo, v_hi = inv_af.min(), inv_af.quantile(0.95)
-    if v_hi <= v_lo:
-        v_hi = v_lo + 1
-    af_norm    = Normalize(vmin=v_lo, vmax=v_hi, clip=True)
-    cmap       = plt.cm.plasma
-    dot_colors = cmap(af_norm(inv_af.values))
-
-    ax.scatter(
-        plot_df["rank_x"].values, y_scaled.values,
-        c=dot_colors, s=20, alpha=0.80,
-        linewidths=0.3, edgecolors="white",
-        zorder=2, rasterized=True,
-    )
-
-    # --- colorbar ---
-    sm = ScalarMappable(cmap=cmap, norm=af_norm)
-    sm.set_array([])
-    cbar = ax.get_figure().colorbar(sm, ax=ax, fraction=0.018, pad=0.01, aspect=30)
-    cbar_ticks = np.linspace(v_lo, v_hi, 5)
-    cbar.set_ticks(cbar_ticks)
-    cbar.set_ticklabels([f"1/{t:.0f}" if t >= 2 else f"{1/t:.2f}" for t in cbar_ticks])
-    cbar.set_label("Allele frequency  (1/AF, rarer →)", fontsize=8, color="#555555")
-    cbar.ax.tick_params(labelsize=7, colors="#555555")
-
-    # --- annotate top-N bins by density (short label: SYMBOL[binN]) ---
-    top      = plot_df.nlargest(top_n, y_col)
+    # --- annotate top-N bins by density ----------------------------------
+    top = plot_df.nlargest(top_n, "density")
     used: list[tuple[float, float]] = []
-    y_max_val = y_scaled.max()
+    y_max_val = y_vals.max()
     for _, row in top.iterrows():
-        symbol = str(row.get("SYMBOL", "?"))
-        bidx   = int(row["bin_index"]) if "bin_index" in row else "?"
-        label  = f"{symbol}[bin{bidx}]"
-        impact = str(row.get("worst_impact", ""))
+        symbol     = str(row.get("SYMBOL", "?"))
+        bidx       = int(row["bin_index"]) if "bin_index" in row else "?"
+        label      = f"{symbol}[bin{bidx}]"
+        impact     = str(row.get("worst_impact", ""))
         font_color = IMPACT_COLORS.get(impact, "#333333")
-        y_val  = row[y_col] * scale
+        y_val      = np.log10(max(row["density"], 1e-15))
 
         y_offset = 14
         for px, py in used:
-            if abs(row["rank_x"] - px) < gap * 3 and abs(y_val - py) < y_max_val * 0.05:
+            if abs(row["rank_x"] - px) < gap * 3 and abs(y_val - py) < abs(y_max_val) * 0.04:
                 y_offset += 12
         used.append((row["rank_x"], y_val))
 
@@ -873,19 +811,23 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
             zorder=5,
         )
 
-    # --- axes ---
-    y_max  = y_scaled.max()
-    y_ceil = y_max * 1.35
-    ref_levels = np.linspace(0, y_max, 6)[1:]
+    # --- y-axis: log10 scale ---------------------------------------------
+    y_min   = y_vals.min()
+    y_max   = y_vals.max()
+    y_range = y_max - y_min
+    y_ceil  = y_max + y_range * 0.20
+    y_floor = y_min - y_range * 0.05
+
+    ref_levels = np.linspace(y_min, y_max, 6)[1:]
     x_right = plot_df["rank_x"].max()
     for level in ref_levels:
         ax.axhline(level, color="#DDDDDD", linewidth=0.8, linestyle="--", zorder=1)
-        ax.text(x_right * 1.001, level, f"{level:.2f}",
+        ax.text(x_right * 1.001, level, f"10^{level:.1f}",
                 va="center", fontsize=7.5, color="#888888")
 
-    ax.set_ylim(-y_max * 0.05, y_ceil)
+    ax.set_ylim(y_floor, y_ceil)
     ax.set_xlim(-gap, x_right + gap)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"$10^{{{y:.1f}}}$"))
     ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both"))
 
     xtick_pos, xtick_lab = [], []
@@ -900,12 +842,11 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
 
     ax.set_xlabel("Chromosome  (bins ordered by genomic position within each chromosome)",
                   fontsize=11, color="#333333", labelpad=8)
-    ax.set_ylabel(f"Mutation Density\n(variants / {unit} / patient)",
+    ax.set_ylabel("log₁₀  Density\n(variant_count / bin_length / n_patients)",
                   fontsize=11, color="#333333")
     ax.set_title(
         f"Bin-Level Variant Density  ·  Cohort: {n_patients} patients  ·  "
-        f"Bins shown: {len(plot_df):,}  ·  "
-        "color = 1/AF (rarer bins brighter)  ·  label color = worst impact",
+        f"Bins shown: {len(plot_df):,}  ·  color & label = worst VEP impact",
         fontsize=11, color="#555555", pad=8,
     )
 
@@ -914,13 +855,13 @@ def _draw_bin_manhattan(ax, plot_df, present_chroms, chrom_to_color,
         for k in ["HIGH", "MODERATE", "LOW", "MODIFIER"]
     ]
     ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
-              framealpha=0.9, title="Label color = worst impact", title_fontsize=8.5)
+              framealpha=0.9, title="Worst VEP Impact", title_fontsize=8.5)
 
 
 def _draw_top_bins(ax, bin_df, top_n, n_patients):
-    """Horizontal bar chart of top-N bins by normalized mutation density."""
+    """Horizontal bar chart of top-N bins by mutation density."""
 
-    sort_col   = "normalized_density" if "normalized_density" in bin_df.columns else "frequency"
+    sort_col   = "density"
     impact_col = "worst_impact" if "worst_impact" in bin_df.columns else None
 
     top = bin_df.nlargest(top_n, sort_col).sort_values(sort_col)
@@ -945,7 +886,7 @@ def _draw_top_bins(ax, bin_df, top_n, n_patients):
                 label, va="center", ha="left", fontsize=6.5, color="#333333")
 
     ax.set_facecolor("#FFFFFF")
-    ax.set_xlabel("Mutation Density (variants / base / patient)", fontsize=10, color="#333333")
+    ax.set_xlabel("Density  (variant_count / bin_length / n_patients)", fontsize=10, color="#333333")
     ax.set_title(f"Top {top_n} Bins by Mutation Density", fontsize=12,
                  fontweight="bold", color="#1C1C1C", pad=10)
     ax.set_xlim(0, x_max * 1.55)
@@ -973,43 +914,40 @@ def _draw_bin_bubble(ax, bin_df, top_n):
                 ha="center", va="center", transform=ax.transAxes)
         return
 
-    df         = bin_df.dropna(subset=["variant_count", "frequency"]).copy()
+    df         = bin_df.dropna(subset=["variant_count", "density"]).copy()
     impact_col = "worst_impact" if "worst_impact" in df.columns else None
-    freq_max   = df["frequency"].max()
+    dens_max   = df["density"].max()
 
     for impact in ["MODIFIER", "LOW", "MODERATE", "HIGH"]:
         sub = df[df[impact_col] == impact] if impact_col else df
         if sub.empty:
             continue
         ax.scatter(
-            sub["variant_count"], sub["frequency"],
+            sub["variant_count"], sub["density"],
             c=IMPACT_COLORS.get(impact, "#95A5A6"),
-            s=30 + sub["frequency"] / max(freq_max, 1e-9) * 160,
+            s=30 + sub["density"] / max(dens_max, 1e-15) * 160,
             alpha=0.65, linewidths=0.3, edgecolors="white",
             label=impact, zorder=2, rasterized=True,
         )
 
-    top = df.nlargest(top_n, "frequency")
+    top = df.nlargest(top_n, "density")
     for _, row in top.iterrows():
         symbol = str(row.get("SYMBOL", "?"))
         bidx   = int(row["bin_index"]) if "bin_index" in row else "?"
         ax.annotate(
             f"{symbol}[bin{bidx}]",
-            xy=(row["variant_count"], row["frequency"]),
+            xy=(row["variant_count"], row["density"]),
             xytext=(5, 3), textcoords="offset points",
             fontsize=6.5, color="#333333", zorder=5,
         )
 
     ax.set_facecolor("#FFFFFF")
     ax.set_xlabel("Number of Variant Observations in Bin", fontsize=10, color="#333333")
-    ax.set_ylabel("Bin Mutation Frequency", fontsize=10, color="#333333")
-    ax.set_title("Variant Richness vs Bin Frequency", fontsize=12,
+    ax.set_ylabel("Density  (variant_count / bin_length / n_patients)", fontsize=10, color="#333333")
+    ax.set_title("Variant Richness vs Bin Density", fontsize=12,
                  fontweight="bold", color="#1C1C1C", pad=10)
 
-    y_max    = df["frequency"].max()
-    decimals = 2 if y_max < 0.10 else (1 if y_max < 0.50 else 0)
-    fmt      = f"{{:.{decimals}%}}"
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: fmt.format(y)))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2e}"))
     ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both"))
     ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=6, prune="both", integer=True))
     for spine in ["top", "right"]:

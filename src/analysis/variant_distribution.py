@@ -3,21 +3,17 @@ variant_distribution.py
 -----------------------
 GWAS-style variant frequency analysis across a cohort of patients.
 
-Streams patient Parquet files one at a time to accumulate:
-  - per-locus variant counts    (locus-level)
-  - per-gene  variant statistics (gene-level)
-  - per-genomic-bin statistics  (bin-level)
+Reads per-patient Parquet files and computes:
+  - per-locus  variant counts
+  - per-gene   variant statistics
+  - per-genomic-bin statistics
 
 Memory model
 ------------
-Each Parquet file is read in batches of _BATCH_SIZE rows so that only one
-chunk is in memory at a time.  Per-patient deduplication is maintained via
-lightweight Python sets of tuple keys — these hold only the *variant* rows
-(non-ref calls), which are a small fraction of the raw VCF rows.
-
-The locus accumulator grows with the number of *unique* (CHROM, POS, REF, ALT)
-loci across the cohort — not n_patients × rows_per_patient.
-Gene stats are O(n_genes × n_patients) — negligible for any realistic cohort.
+All heavy aggregation is executed inside DuckDB, which reads Parquet files
+in columnar streaming batches and automatically spills intermediate state to
+disk when working sets exceed available RAM.  Python only receives the final,
+compacted result DataFrames — never the raw per-row data.
 
 Usage
 -----
@@ -31,19 +27,18 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
+import duckdb
 import matplotlib.pyplot as plt
 import pandas as pd
 import pyarrow.parquet as pq
-from tqdm import tqdm
+from loguru import logger
 
 from plots import (
     CHROM_ORDER,
     IMPACT_RANK,
-    make_figure,
     make_gene_figure,
     make_bin_figure,
 )
@@ -53,321 +48,377 @@ from plots import (
 # Constants
 # ---------------------------------------------------------------------------
 
-_LOCUS_KEY  = ["CHROM", "POS", "REF", "ALT"]
 _ANN_COLS   = ["SYMBOL", "Consequence", "IMPACT", "Gene"]
-_PASS1_COLS = _LOCUS_KEY + _ANN_COLS + ["GT"]
-_PASS2_COLS = ["SYMBOL", "CHROM", "POS", "REF", "ALT", "IMPACT", "GT"]
+_PASS1_COLS = ["CHROM", "POS", "REF", "ALT"] + ["GT"] + _ANN_COLS
+_PASS2_COLS = ["CHROM", "POS", "REF", "ALT", "GT", "SYMBOL", "IMPACT"]
 
-_REF_CALLS      = frozenset({"0/0", "./.", "0|0", ".|."})
+# SQL IN-list for reference / missing genotype strings
+_REF_CALLS_SQL = "('0/0', './.', '0|0', '.|.')"
+
+# SQL CASE expression: maps IMPACT text to integer rank (mirrors IMPACT_RANK)
+_IMPACT_RANK_SQL = """
+    CASE IMPACT WHEN 'HIGH' THEN 4 WHEN 'MODERATE' THEN 3
+                WHEN 'LOW'  THEN 2 ELSE 1 END
+"""
+
 _RANK_TO_IMPACT = {v: k for k, v in IMPACT_RANK.items()}
 
-# Rows read from a Parquet file per iteration — keeps peak RSS manageable.
-_BATCH_SIZE = 100_000
+
+# ---------------------------------------------------------------------------
+# DuckDB utilities
+# ---------------------------------------------------------------------------
+
+def _open_db() -> duckdb.DuckDBPyConnection:
+    """
+    Open an in-process DuckDB connection.
+    The temp directory allows DuckDB to spill to disk automatically, so
+    large cohorts (hundreds of patients) do not exhaust RAM.
+    """
+    con = duckdb.connect()
+    con.execute("SET temp_directory = '/tmp/duckdb_gwas_spill'")
+    return con
+
+
+def _available(parquet_files: list[Path], wanted: list[str]) -> list[str]:
+    """Return the subset of *wanted* columns present in the Parquet schema."""
+    present = set(pq.read_schema(parquet_files[0]).names)
+    return [c for c in wanted if c in present]
+
+
+def _union_sql(parquet_files: list[Path], cols: list[str]) -> str:
+    """
+    Build a UNION ALL query that reads all Parquet files in one sweep.
+    Each row is tagged with a numeric patient index (_pid) so downstream
+    queries can use COUNT(DISTINCT _pid) for per-patient deduplication.
+    Columns absent from the schema are emitted as NULL to keep a uniform schema.
+    """
+    present = set(pq.read_schema(parquet_files[0]).names)
+    exprs = []
+    for c in cols:
+        if c == "POS":
+            # Always cast POS to BIGINT for safe arithmetic
+            exprs.append("CAST(POS AS BIGINT) AS POS")
+        elif c in present:
+            exprs.append(c)
+        else:
+            # Column missing from this cohort — emit NULL with the expected name
+            exprs.append(f"NULL AS {c}")
+    col_str = ", ".join(exprs)
+    parts = [
+        f"SELECT {i} AS _pid, {col_str} FROM read_parquet('{f}')"
+        for i, f in enumerate(parquet_files)
+    ]
+    return "\n    UNION ALL\n    ".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Pass 1 — locus + gene aggregation
 # ---------------------------------------------------------------------------
 
-def _iter_batches(path: Path, wanted: list[str]) -> Iterator[pd.DataFrame]:
-    """Yield DataFrame chunks of *wanted* columns from a Parquet file."""
-    available = set(pq.read_schema(path).names)
-    cols = [c for c in wanted if c in available]
-    pf = pq.ParquetFile(path)
-    for batch in pf.iter_batches(batch_size=_BATCH_SIZE, columns=cols):
-        yield batch.to_pandas()
+def _gnomad_af_filter_sql(present: list[str], max_af: float) -> str:
+    """
+    Return a SQL WHERE fragment that keeps only rare variants.
 
+    Variants where gnomADg_AF is NULL (novel / not in gnomAD) are always
+    retained — they are the most relevant candidates in rare-disease studies.
+    Variants with gnomADg_AF > max_af are dropped.
 
-def _filter_gt(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop homozygous-reference and missing genotype rows."""
-    if "GT" not in df.columns:
-        return df
-    return df[~df["GT"].isin(_REF_CALLS)]
+    If the gnomADg_AF column is absent from the schema the filter is omitted
+    and a no-op empty string is returned.
+    """
+    if "gnomADg_AF" not in present:
+        logger.warning("gnomADg_AF column absent — gnomAD AF filter will not be applied")
+        return ""
+    return (
+        f" AND (gnomADg_AF IS NULL"
+        f" OR TRY_CAST(gnomADg_AF AS DOUBLE) IS NULL"
+        f" OR TRY_CAST(gnomADg_AF AS DOUBLE) <= {max_af})"
+    )
 
-
-def _prep_pos(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce POS to int, drop non-numeric rows in-place on a copy."""
-    df = df.copy()
-    df["POS"] = pd.to_numeric(df["POS"], errors="coerce")
-    return df.dropna(subset=["POS"]).astype({"POS": int})
-
-
-# ---------------------------------------------------------------------------
-# Pass 1 — locus + gene accumulation
-# ---------------------------------------------------------------------------
 
 def _pass1(
+    con: duckdb.DuckDBPyConnection,
     parquet_files: list[Path],
-) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
+    max_gnomad_af: float,
+) -> pd.DataFrame:
     """
-    Stream all patient Parquet files once, reading _BATCH_SIZE rows at a time.
+    Compute per-gene aggregated stats via DuckDB.
 
-    Returns
-    -------
-    locus_count   : pd.Series  keyed by (CHROM, POS, REF, ALT) MultiIndex
-                    value = number of patients carrying that locus
-    locus_ann     : pd.DataFrame with the same MultiIndex, annotation columns
-                    populated from the first patient that carries each locus
-    gene_agg_df   : pd.DataFrame with one row per unique (SYMBOL, CHROM)
+    Strategy:
+      1. UNION ALL all Parquet files, tagging every row with its patient index.
+      2. GROUP BY (patient, CHROM, POS, REF, ALT) collapses multi-transcript
+         VEP duplicates so each variant is counted only once per patient.
+      3. A second GROUP BY across patients gives cohort-level counts.
+
+    DuckDB executes this with streaming I/O and disk spill; Python never
+    holds more than the final aggregated DataFrames in memory.
     """
-    locus_count: pd.Series | None    = None
-    locus_ann:   pd.DataFrame | None = None
-    gene_agg:    pd.DataFrame | None = None
+    logger.info("Pass1 starting — {} parquet file(s)", len(parquet_files))
+    logger.info("Pass1 gnomAD AF filter  : gnomADg_AF <= {}", max_gnomad_af)
 
-    for f in tqdm(parquet_files, desc="  Pass 1/2 – locus + gene", unit="pt"):
-        # Per-patient dedup state (sets of tuple keys for seen variant loci)
-        seen_loci:      set[tuple] = set()
-        seen_gene_loci: set[tuple] = set()
-        # Per-patient gene accumulator: (SYMBOL, CHROM) -> stats dict
-        patient_gene: dict[tuple, dict] = {}
+    # Include gnomADg_AF in the columns to read so the filter can be applied
+    pass1_cols  = _PASS1_COLS + ["gnomADg_AF"]
+    present     = _available(parquet_files, pass1_cols)
+    ann_present = [c for c in _ANN_COLS if c in present]
+    logger.debug("Pass1 columns available : {}", present)
+    logger.debug("Pass1 annotation cols   : {}", ann_present)
+    missing = [c for c in _PASS1_COLS if c not in present]
+    if missing:
+        logger.warning("Pass1 missing expected cols: {}", missing)
 
-        avail_locus: list[str] = []
-        avail_ann:   list[str] = []
+    union       = _union_sql(parquet_files, present)
 
-        for df in _iter_batches(f, _PASS1_COLS):
-            df = _filter_gt(df)
-            if df.empty:
-                continue
+    # Filter: drop reference/missing calls, null coordinates, and common variants
+    base_where = (
+        f"GT IS NOT NULL AND GT NOT IN {_REF_CALLS_SQL}"
+        " AND CHROM IS NOT NULL AND POS IS NOT NULL"
+        " AND REF IS NOT NULL AND ALT IS NOT NULL"
+        + _gnomad_af_filter_sql(present, max_gnomad_af)
+    )
 
-            if not avail_locus:
-                avail_locus = [c for c in _LOCUS_KEY if c in df.columns]
-                avail_ann   = [c for c in _ANN_COLS  if c in df.columns]
+    # Dedup CTE: one row per (patient, locus).
+    # FIRST() keeps annotations from whichever transcript row DuckDB sees first.
+    ann_agg = (
+        ",\n               ".join(f"FIRST({c}) AS {c}" for c in ann_present)
+    )
+    ann_comma = (",\n               " + ann_agg) if ann_present else ""
 
-            # ---- Locus accumulation: deduplicate within this patient ------
-            loci_tuples = list(zip(*(df[c] for c in avail_locus)))
-            new_mask    = [t not in seen_loci for t in loci_tuples]
-            seen_loci.update(t for t, m in zip(loci_tuples, new_mask) if m)
+    deduped_cte = f"""
+    deduped AS (
+        SELECT _pid, CHROM, POS, REF, ALT{ann_comma}
+        FROM ({union})
+        WHERE {base_where}
+        GROUP BY _pid, CHROM, POS, REF, ALT
+    )"""
 
-            new_loci_df = df.loc[[i for i, m in zip(df.index, new_mask) if m]]
-            if not new_loci_df.empty:
-                new_idx    = pd.MultiIndex.from_frame(new_loci_df[avail_locus])
-                new_counts = pd.Series(1, index=new_idx, dtype="int32")
-                if locus_count is None:
-                    locus_count = new_counts.rename("patient_count")
-                    locus_ann   = new_loci_df[avail_locus + avail_ann].set_index(avail_locus)
-                else:
-                    locus_count = locus_count.add(new_counts, fill_value=0).astype("int32")
-                    truly_new   = new_counts.index.difference(locus_ann.index)
-                    if len(truly_new):
-                        new_ann   = new_loci_df[avail_locus + avail_ann].set_index(avail_locus)
-                        locus_ann = pd.concat(
-                            [locus_ann, new_ann.loc[new_ann.index.isin(truly_new)]]
-                        )
-
-            # ---- Gene stats for this patient / batch ---------------------
-            if "SYMBOL" not in df.columns:
-                continue
-
-            g = df.dropna(subset=["SYMBOL"])
-            g = g[g["SYMBOL"].astype(str).str.strip() != ""]
-            g = _prep_pos(g)
-            if g.empty:
-                continue
-
-            if "IMPACT" in g.columns:
-                g = g.copy()
-                g["_rank"] = g["IMPACT"].map(IMPACT_RANK).fillna(0).astype("int8")
-            else:
-                g = g.assign(_rank=0)
-
-            dedup_cols     = ["SYMBOL", "CHROM", "POS"] + [c for c in ["REF", "ALT"] if c in g.columns]
-            gene_loci_keys = list(zip(*(g[c] for c in dedup_cols)))
-            new_gene_mask  = [t not in seen_gene_loci for t in gene_loci_keys]
-            seen_gene_loci.update(t for t, m in zip(gene_loci_keys, new_gene_mask) if m)
-
-            ng = g.loc[[i for i, m in zip(g.index, new_gene_mask) if m]]
-            if ng.empty:
-                continue
-
-            for (symbol, chrom), grp in ng.groupby(["SYMBOL", "CHROM"], sort=False):
-                key = (symbol, chrom)
-                vc  = len(grp)
-                gs_val = int(grp["POS"].min())
-                ge_val = int(grp["POS"].max())
-                ir     = int(grp["_rank"].max())
-                if key not in patient_gene:
-                    patient_gene[key] = {
-                        "variant_count":     vc,
-                        "gene_start":        gs_val,
-                        "gene_end":          ge_val,
-                        "worst_impact_rank": ir,
-                    }
-                else:
-                    s = patient_gene[key]
-                    s["variant_count"]     += vc
-                    s["gene_start"]         = min(s["gene_start"], gs_val)
-                    s["gene_end"]           = max(s["gene_end"],   ge_val)
-                    s["worst_impact_rank"]  = max(s["worst_impact_rank"], ir)
-
-        # Merge this patient's gene stats into the global accumulator
-        if patient_gene:
-            records = [
-                {"SYMBOL": sym, "CHROM": chrom, "patient_count": 1, **stats}
-                for (sym, chrom), stats in patient_gene.items()
-            ]
-            gs_df = pd.DataFrame(records).set_index(["SYMBOL", "CHROM"])
-            if gene_agg is None:
-                gene_agg = gs_df
-            else:
-                gene_agg = (
-                    pd.concat([gene_agg, gs_df])
-                    .groupby(level=["SYMBOL", "CHROM"], sort=False)
-                    .agg({
-                        "patient_count":     "sum",
-                        "variant_count":     "sum",
-                        "gene_start":        "min",
-                        "gene_end":          "max",
-                        "worst_impact_rank": "max",
-                    })
-                )
-
-    if gene_agg is not None:
-        gene_agg_df = gene_agg.reset_index()
-    else:
-        gene_agg_df = pd.DataFrame(columns=[
+    # Gene table: aggregate per (patient, gene) first to avoid double-counting
+    # variants shared across transcripts, then sum across patients.
+    if "SYMBOL" not in present:
+        logger.warning("Pass1 SYMBOL column absent — returning empty gene table")
+        gene_df = pd.DataFrame(columns=[
             "SYMBOL", "CHROM", "patient_count", "variant_count",
             "gene_start", "gene_end", "worst_impact_rank",
         ])
-    return locus_count, locus_ann, gene_agg_df
+    else:
+        impact_expr = _IMPACT_RANK_SQL if "IMPACT" in present else "1"
+        if "IMPACT" not in present:
+            logger.warning("Pass1 IMPACT column absent — all impact ranks will be 1")
+        logger.info("Pass1 executing gene aggregation SQL …")
+        try:
+            gene_df = con.execute(f"""
+                WITH {deduped_cte},
+                -- Per-patient gene stats (locus dedup already applied above)
+                per_patient AS (
+                    SELECT _pid, SYMBOL, CHROM,
+                           COUNT(*)            AS variant_count,
+                           MIN(POS)            AS gene_start,
+                           MAX(POS)            AS gene_end,
+                           MAX({impact_expr})  AS worst_impact_rank
+                    FROM deduped
+                    WHERE SYMBOL IS NOT NULL AND SYMBOL != ''
+                    GROUP BY _pid, SYMBOL, CHROM
+                )
+                -- Cohort-level aggregation across all patients
+                SELECT SYMBOL, CHROM,
+                       COUNT(DISTINCT _pid)   AS patient_count,
+                       SUM(variant_count)     AS variant_count,
+                       MIN(gene_start)        AS gene_start,
+                       MAX(gene_end)          AS gene_end,
+                       MAX(worst_impact_rank) AS worst_impact_rank
+                FROM per_patient
+                GROUP BY SYMBOL, CHROM
+            """).df()
+        except Exception as exc:
+            logger.error("Pass1 SQL execution failed: {}", exc)
+            raise
+
+        logger.info("Pass1 result: {:,} gene rows, columns={}", len(gene_df), list(gene_df.columns))
+        if gene_df.empty:
+            logger.warning("Pass1 gene aggregation returned 0 rows after filtering")
+        else:
+            null_symbol = gene_df["SYMBOL"].isna().sum()
+            null_chrom  = gene_df["CHROM"].isna().sum()
+            if null_symbol:
+                logger.warning("Pass1 {:,} rows with null SYMBOL", null_symbol)
+            if null_chrom:
+                logger.warning("Pass1 {:,} rows with null CHROM", null_chrom)
+            logger.debug(
+                "Pass1 variant_count range: [{}, {}]",
+                gene_df["variant_count"].min(), gene_df["variant_count"].max(),
+            )
+            logger.debug(
+                "Pass1 patient_count range: [{}, {}]",
+                gene_df["patient_count"].min(), gene_df["patient_count"].max(),
+            )
+
+    return gene_df
 
 
 # ---------------------------------------------------------------------------
-# Pass 2 — bin accumulation
+# Pass 2 — bin aggregation
 # ---------------------------------------------------------------------------
 
 def _pass2(
-    parquet_files:  list[Path],
+    con: duckdb.DuckDBPyConnection,
+    parquet_files: list[Path],
     gene_bounds_df: pd.DataFrame,
-    n_patients:     int,
-    bin_length:     int,
-    overlap:        int,
+    n_patients: int,
+    bin_length: int,
+    overlap: int,
+    max_gnomad_af: float,
 ) -> pd.DataFrame:
     """
-    Stream all patient Parquet files a second time, reading _BATCH_SIZE rows
-    at a time and computing per-bin stats.
+    Assign each unique variant locus to genomic bins and aggregate per-bin.
 
-    Gene boundaries from Pass 1 enable fully vectorised bin assignment for
-    the no-overlap case and a fast list-comprehension explode for overlap > 0.
-    Only ~7 columns are read from each Parquet file.
+    Gene boundaries from Pass 1 are registered as a small DuckDB virtual
+    table for an efficient JOIN (O(n_genes) memory, not O(n_variants)).
+
+    No-overlap bins: integer division maps each locus to exactly one bin.
+    Overlapping bins: UNNEST(range(b_min, b_max+1)) explodes each locus into
+    all bins it overlaps before aggregating — runs entirely inside DuckDB.
     """
-    step    = bin_length - overlap
-    bin_agg: pd.DataFrame | None = None
+    logger.info(
+        "Pass2 starting — bin_length={:,}, overlap={:,}, n_patients={}, gene_bounds={:,} genes",
+        bin_length, overlap, n_patients, len(gene_bounds_df),
+    )
 
-    _BIN_IDX = ["SYMBOL", "CHROM", "bin_id", "bin_start", "bin_end"]
+    step = bin_length - overlap
 
-    for f in tqdm(parquet_files, desc="  Pass 2/2 – bins      ", unit="pt"):
-        # Per-patient dedup state
-        seen_loci: set[tuple] = set()
-        # Per-patient bin accumulator (no patient_count yet)
-        patient_bin: pd.DataFrame | None = None
-
-        for df in _iter_batches(f, _PASS2_COLS):
-            df = _filter_gt(df)
-            if df.empty or "SYMBOL" not in df.columns:
-                continue
-
-            g = df.dropna(subset=["SYMBOL"])
-            g = g[g["SYMBOL"].astype(str).str.strip() != ""]
-            g = _prep_pos(g)
-            if g.empty:
-                continue
-
-            # Deduplicate to unique loci for this patient (across batches)
-            dedup_cols     = ["SYMBOL", "CHROM", "POS"] + [c for c in ["REF", "ALT"] if c in g.columns]
-            loci_tuples    = list(zip(*(g[c] for c in dedup_cols)))
-            new_mask       = [t not in seen_loci for t in loci_tuples]
-            seen_loci.update(t for t, m in zip(loci_tuples, new_mask) if m)
-
-            g = g.loc[[i for i, m in zip(g.index, new_mask) if m]].copy()
-            if g.empty:
-                continue
-
-            # Vectorised IMPACT → rank
-            g["_rank"] = (
-                g["IMPACT"].map(IMPACT_RANK).fillna(0).astype("int8")
-                if "IMPACT" in g.columns else 0
-            )
-
-            # Join gene boundaries; discard loci outside observed gene span
-            g = g.merge(gene_bounds_df[["SYMBOL", "CHROM", "gene_start", "gene_end"]],
-                        on=["SYMBOL", "CHROM"], how="inner")
-            g = g[(g["POS"] >= g["gene_start"]) & (g["POS"] <= g["gene_end"])]
-            if g.empty:
-                continue
-
-            if overlap == 0:
-                # ---- Fast path: one bin per locus, fully vectorised ------
-                g["bin_id"]    = (g["POS"] - g["gene_start"]) // bin_length
-                g["bin_start"] = g["gene_start"] + g["bin_id"] * bin_length
-                g["bin_end"]   = (g["bin_start"] + bin_length - 1).clip(upper=g["gene_end"])
-
-                bin_stats = (
-                    g.groupby(_BIN_IDX, sort=False)
-                    .agg(variant_count    =("POS",   "count"),
-                         worst_impact_rank=("_rank", "max"))
-                    .reset_index()
-                )
-
-            else:
-                # ---- Overlap path: each locus may belong to multiple bins
-                g["b_max"] = (g["POS"] - g["gene_start"]) // step
-                g["b_min"] = (
-                    -((g["gene_start"] + bin_length - 1 - g["POS"]) // step)
-                ).clip(lower=0)
-
-                g["bin_ids"] = [
-                    list(range(lo, hi + 1))
-                    for lo, hi in zip(g["b_min"], g["b_max"])
-                ]
-                g = g.explode("bin_ids").rename(columns={"bin_ids": "bin_id"})
-                g["bin_id"]    = g["bin_id"].astype(int)
-                g["bin_start"] = g["gene_start"] + g["bin_id"] * step
-                g["bin_end"]   = (g["bin_start"] + bin_length - 1).clip(upper=g["gene_end"])
-                g = g[g["bin_start"] <= g["gene_end"]]
-
-                bin_stats = (
-                    g.groupby(_BIN_IDX, sort=False)
-                    .agg(variant_count    =("POS",   "count"),
-                         worst_impact_rank=("_rank", "max"))
-                    .reset_index()
-                )
-
-            bs = bin_stats.set_index(_BIN_IDX)
-            if patient_bin is None:
-                patient_bin = bs
-            else:
-                patient_bin = (
-                    pd.concat([patient_bin, bs])
-                    .groupby(level=_BIN_IDX, sort=False)
-                    .agg({"variant_count": "sum", "worst_impact_rank": "max"})
-                )
-
-        # Merge this patient's bins into the global accumulator
-        if patient_bin is not None:
-            patient_bin = patient_bin.copy()
-            patient_bin["patient_count"] = 1
-            if bin_agg is None:
-                bin_agg = patient_bin
-            else:
-                bin_agg = (
-                    pd.concat([bin_agg, patient_bin])
-                    .groupby(level=_BIN_IDX, sort=False)
-                    .agg({"patient_count":     "sum",
-                          "variant_count":     "sum",
-                          "worst_impact_rank": "max"})
-                )
-
-    if bin_agg is None:
+    if gene_bounds_df.empty:
+        logger.warning("Pass2 gene_bounds_df is empty — no bins can be computed")
         return pd.DataFrame()
 
-    bin_df = bin_agg.reset_index()
+    null_bounds = gene_bounds_df[["gene_start", "gene_end"]].isna().any(axis=1).sum()
+    if null_bounds:
+        logger.warning("Pass2 {:,} gene_bounds rows have null start/end", null_bounds)
 
-    bin_df["frequency"]          = bin_df["patient_count"] / n_patients
+    # Register gene boundaries so DuckDB can JOIN without re-reading Parquet
+    con.register("_gene_bounds", gene_bounds_df[["SYMBOL", "CHROM", "gene_start", "gene_end"]])
+
+    pass2_cols  = _PASS2_COLS + ["gnomADg_AF"]
+    present     = _available(parquet_files, pass2_cols)
+    logger.debug("Pass2 columns available : {}", present)
+    missing = [c for c in _PASS2_COLS if c not in present]
+    if missing:
+        logger.warning("Pass2 missing expected cols: {}", missing)
+
+    union       = _union_sql(parquet_files, present)
+    impact_expr = _IMPACT_RANK_SQL if "IMPACT" in present else "1"
+    if "IMPACT" not in present:
+        logger.warning("Pass2 IMPACT column absent — all impact ranks will be 1")
+
+    # Prefix gnomADg_AF with "v." to match the aliased subquery in Pass 2
+    gnomad_filter = _gnomad_af_filter_sql(present, max_gnomad_af).replace(
+        "gnomADg_AF", "v.gnomADg_AF"
+    )
+    base_where = (
+        f"v.GT IS NOT NULL AND v.GT NOT IN {_REF_CALLS_SQL}"
+        " AND v.SYMBOL IS NOT NULL AND v.SYMBOL != ''"
+        " AND v.POS IS NOT NULL"
+        + gnomad_filter
+    )
+
+    # Include REF/ALT in the dedup key when available so that two different
+    # alleles at the same POS (multi-allelic site) are counted separately,
+    # consistent with how Pass 1 deduplicates on (CHROM, POS, REF, ALT).
+    ref_alt_group = ", v.REF, v.ALT" if all(c in present for c in ["REF", "ALT"]) else ""
+    if not ref_alt_group:
+        logger.warning("Pass2 REF/ALT absent — multi-allelic sites will not be split")
+
+    # Dedup CTE: one row per (patient, SYMBOL, CHROM, POS, REF, ALT) with worst impact.
+    # The JOIN with _gene_bounds is inlined here to avoid a second scan later.
+    deduped_cte = f"""
+    deduped AS (
+        SELECT v._pid, v.SYMBOL, v.CHROM, v.POS,
+               MAX({impact_expr}) AS impact_rank,
+               g.gene_start, g.gene_end
+        FROM ({union}) v
+        JOIN _gene_bounds g ON v.SYMBOL = g.SYMBOL AND v.CHROM = g.CHROM
+        WHERE {base_where}
+          AND v.POS BETWEEN g.gene_start AND g.gene_end
+        GROUP BY v._pid, v.SYMBOL, v.CHROM, v.POS{ref_alt_group}, g.gene_start, g.gene_end
+    )"""
+
+    _BIN_GROUP = "SYMBOL, CHROM, bin_id, bin_start, bin_end"
+
+    if overlap == 0:
+        logger.info("Pass2 using no-overlap (fast) bin path")
+        # Fast path: integer division assigns each locus to one bin directly
+        bin_sql = f"""
+        WITH {deduped_cte},
+        binned AS (
+            SELECT _pid, SYMBOL, CHROM, impact_rank,
+                   (POS - gene_start) / {bin_length}                              AS bin_id,
+                   gene_start + ((POS - gene_start) / {bin_length}) * {bin_length}  AS bin_start,
+                   LEAST(
+                       gene_start + ((POS - gene_start) / {bin_length}) * {bin_length} + {bin_length} - 1,
+                       gene_end
+                   )                                                               AS bin_end
+            FROM deduped
+        )
+        SELECT {_BIN_GROUP},
+               COUNT(*)             AS variant_count,
+               MAX(impact_rank)     AS worst_impact_rank,
+               COUNT(DISTINCT _pid) AS patient_count
+        FROM binned
+        GROUP BY {_BIN_GROUP}
+        """
+    else:
+        logger.info("Pass2 using overlap bin path (step={:,})", step)
+        # Overlap path: compute the range of bin indices [b_min, b_max] that
+        # each locus overlaps, then UNNEST(range(...)) explodes it into one
+        # row per (locus, bin) before aggregating.
+        bin_sql = f"""
+        WITH {deduped_cte},
+        with_range AS (
+            SELECT *,
+                   -- Earliest bin index whose window reaches this locus
+                   GREATEST(0,
+                       CAST(CEIL((POS - gene_start - {bin_length} + 1.0) / {step}) AS BIGINT)
+                   )                                                              AS b_min,
+                   -- Latest bin index whose window starts at or before this locus
+                   CAST((POS - gene_start) / {step} AS BIGINT)                   AS b_max
+            FROM deduped
+        ),
+        -- One row per (locus × bin) — DuckDB unnests the integer range in-engine
+        exploded AS (
+            SELECT _pid, SYMBOL, CHROM, impact_rank, gene_start, gene_end,
+                   UNNEST(range(b_min, b_max + 1)) AS bin_id
+            FROM with_range
+        )
+        SELECT SYMBOL, CHROM, bin_id,
+               gene_start + bin_id * {step}                                      AS bin_start,
+               LEAST(gene_start + bin_id * {step} + {bin_length} - 1, gene_end) AS bin_end,
+               COUNT(*)             AS variant_count,
+               MAX(impact_rank)     AS worst_impact_rank,
+               COUNT(DISTINCT _pid) AS patient_count
+        FROM exploded
+        WHERE gene_start + bin_id * {step} <= gene_end
+        GROUP BY SYMBOL, CHROM, bin_id, gene_start, gene_end
+        """
+
+    logger.info("Pass2 executing bin aggregation SQL …")
+    try:
+        bin_df = con.execute(bin_sql).df()
+    except Exception as exc:
+        logger.error("Pass2 SQL execution failed: {}", exc)
+        raise
+
+    logger.info("Pass2 raw result: {:,} bin rows", len(bin_df))
+    if bin_df.empty:
+        logger.warning(
+            "Pass2 bin aggregation returned 0 rows — "
+            "check that SYMBOL/CHROM values match between variants and gene_bounds"
+        )
+        return pd.DataFrame()
+
+    # Derive frequency, density, and a human-readable impact label in Python
     bin_df["bin_length_actual"]  = bin_df["bin_end"] - bin_df["bin_start"] + 1
-    bin_df["normalized_density"] = bin_df["variant_count"] / (bin_length * n_patients)
+    bin_df["density"]            = bin_df["variant_count"] / (bin_df["bin_length_actual"] * n_patients)
     bin_df["worst_impact"]       = bin_df["worst_impact_rank"].map(_RANK_TO_IMPACT).fillna("MODIFIER")
     bin_df = bin_df.drop(columns=["worst_impact_rank"])
 
+    # Sort and assign sequential bin indices + readable names
     bin_df = bin_df.sort_values(["CHROM", "SYMBOL", "bin_start"]).reset_index(drop=True)
     bin_df["bin_index"] = bin_df.groupby(["SYMBOL", "CHROM"]).cumcount() + 1
     bin_df["bin_name"]  = (
@@ -379,8 +430,8 @@ def _pass2(
     col_order = [
         "bin_name", "CHROM", "SYMBOL", "bin_index",
         "bin_start", "bin_end", "bin_length_actual",
-        "patient_count", "frequency", "variant_count",
-        "normalized_density", "worst_impact", "POS",
+        "patient_count", "variant_count", "density",
+        "worst_impact", "POS",
     ]
     return (
         bin_df[[c for c in col_order if c in bin_df.columns]]
@@ -397,53 +448,41 @@ def stream_aggregate(
     input_dir: Path,
     bin_length: int,
     overlap:    int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
+    max_gnomad_af: float = 0.01,
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
     """
-    Two-pass streaming aggregation over all patient Parquet files.
+    Two-pass DuckDB aggregation over all patient Parquet files.
 
-    Pass 1 reads ~9 columns; Pass 2 reads ~7 columns.
-    Peak memory is dominated by the locus accumulator, which is proportional
-    to the number of *unique* loci across the cohort, not to
-    n_patients × rows_per_patient.
+    Pass 1 computes gene-level stats.
+    Pass 2 uses the gene boundaries from Pass 1 to compute bin-level stats.
 
     Returns
     -------
-    freq_df    : per-locus  variant frequency DataFrame
     gene_df    : per-gene   variant frequency DataFrame
     bin_df     : per-bin    variant frequency DataFrame
     n_patients : number of patient files processed
     """
     parquet_files = sorted(input_dir.glob("*.parquet"))
     if not parquet_files:
-        sys.exit(f"[ERROR] No Parquet files found in: {input_dir.resolve()}")
+        logger.error("No Parquet files found in: {}", input_dir.resolve())
+        sys.exit(1)
 
     n_patients = len(parquet_files)
-    print(f"  Found {n_patients} patient Parquet files in {input_dir.resolve()}")
+    logger.info("Found {} patient Parquet files in {}", n_patients, input_dir.resolve())
 
-    # ---- Pass 1 ----------------------------------------------------------
-    locus_count, locus_ann, all_gene_stats = _pass1(parquet_files)
+    con = _open_db()
 
-    if locus_count is None:
-        sys.exit("[ERROR] No variant data found after filtering.")
+    # ---- Pass 1: gene ---------------------------------------------------
+    gene_raw = _pass1(con, parquet_files, max_gnomad_af)
 
-    # ---- Variant-level result --------------------------------------------
-    avail_locus = list(locus_count.index.names)
-    avail_ann   = [c for c in _ANN_COLS if locus_ann is not None and c in locus_ann.columns]
+    if gene_raw.empty:
+        logger.error("No variant data found after filtering.")
+        sys.exit(1)
 
-    freq_df = locus_count.rename("patient_count").reset_index()
-    if avail_ann:
-        freq_df = freq_df.merge(locus_ann[avail_ann].reset_index(),
-                                on=avail_locus, how="left")
-    freq_df["frequency"] = freq_df["patient_count"] / n_patients
-    freq_df = _prep_pos(freq_df).sort_values(["CHROM", "POS"]).reset_index(drop=True)
-
-    print(f"  Unique variant loci : {len(freq_df):,}")
-
-    # ---- Gene-level result -----------------------------------------------
-    gene_df = all_gene_stats.copy()
-    gene_df["frequency"]          = gene_df["patient_count"] / n_patients
+    # Build gene_df: add derived columns (frequency, density, impact label)
+    gene_df = gene_raw.copy()
     gene_df["gene_length"]        = (gene_df["gene_end"] - gene_df["gene_start"] + 1).clip(lower=1)
-    gene_df["normalized_density"] = gene_df["variant_count"] / (gene_df["gene_length"] * n_patients)
+    gene_df["density"]            = gene_df["variant_count"] / (gene_df["gene_length"] * n_patients)
     gene_df["worst_impact"]       = gene_df["worst_impact_rank"].map(_RANK_TO_IMPACT).fillna("MODIFIER")
     gene_df["POS"]                = gene_df["gene_start"].fillna(0).astype(int)
     gene_df = (
@@ -452,24 +491,25 @@ def stream_aggregate(
         .sort_values(["CHROM", "POS"])
         .reset_index(drop=True)
     )
-    print(f"  Unique genes        : {len(gene_df):,}")
+    logger.info("Unique genes        : {:,}", len(gene_df))
 
-    # ---- Pass 2: bins ----------------------------------------------------
+    # ---- Pass 2: bins ---------------------------------------------------
     gene_bounds_df = gene_df[["SYMBOL", "CHROM", "gene_start", "gene_end"]]
-    bin_df = _pass2(parquet_files, gene_bounds_df, n_patients, bin_length, overlap)
-    print(f"  Total bins          : {len(bin_df):,}")
+    bin_df = _pass2(con, parquet_files, gene_bounds_df, n_patients, bin_length, overlap, max_gnomad_af)
+    logger.info("Total bins          : {:,}", len(bin_df))
 
-    return freq_df, gene_df, bin_df, n_patients
+    con.close()
+    return gene_df, bin_df, n_patients
 
 
 # ---------------------------------------------------------------------------
 # Chromosome layout helpers
 # ---------------------------------------------------------------------------
 
-def build_chrom_offsets(freq_df: pd.DataFrame) -> dict[str, int]:
+def build_chrom_offsets(gene_df: pd.DataFrame) -> dict[str, int]:
     """Cumulative x-axis offset per chromosome for Manhattan-style layout."""
-    present   = [c for c in CHROM_ORDER if c in freq_df["CHROM"].values]
-    chrom_max = freq_df.groupby("CHROM")["POS"].max().to_dict()
+    present   = [c for c in CHROM_ORDER if c in gene_df["CHROM"].values]
+    chrom_max = gene_df.groupby("CHROM")["gene_end"].max().to_dict()
     gap       = 10_000_000
     offsets: dict[str, int] = {}
     cursor = 0
@@ -479,50 +519,95 @@ def build_chrom_offsets(freq_df: pd.DataFrame) -> dict[str, int]:
     return offsets
 
 
-def assign_cumulative_pos(freq_df: pd.DataFrame, offsets: dict[str, int]) -> pd.DataFrame:
+def assign_cumulative_pos(df: pd.DataFrame, offsets: dict[str, int]) -> pd.DataFrame:
     """Vectorised cumulative position assignment (no row-wise apply)."""
-    freq_df = freq_df.copy()
-    freq_df["cum_pos"] = freq_df["CHROM"].map(offsets).fillna(0).astype(int) + freq_df["POS"]
-    return freq_df
+    df = df.copy()
+    df["cum_pos"] = df["CHROM"].map(offsets).fillna(0).astype(int) + df["POS"]
+    return df
 
 
 # ---------------------------------------------------------------------------
 # Summary statistics
 # ---------------------------------------------------------------------------
 
-def print_summary(freq_df: pd.DataFrame, n_patients: int, top_n: int = 10) -> None:
-    print("\n" + "=" * 60)
-    print("  VARIANT DISTRIBUTION SUMMARY")
-    print("=" * 60)
-    print(f"  Patients in cohort          : {n_patients}")
-    print(f"  Unique variant loci         : {len(freq_df):,}")
+def print_summary(
+    gene_df: pd.DataFrame,
+    bin_df: pd.DataFrame,
+    n_patients: int,
+    top_n: int = 10,
+) -> None:
+    logger.info("=" * 60)
+    logger.info("  VARIANT DISTRIBUTION SUMMARY")
+    logger.info("=" * 60)
+    logger.info("  Patients in cohort          : {}", n_patients)
 
-    if "IMPACT" in freq_df.columns:
+    # ------------------------------------------------------------------
+    # Gene-level section
+    # ------------------------------------------------------------------
+    logger.info("-" * 60)
+    logger.info("  GENE LEVEL")
+    logger.info("-" * 60)
+    logger.info("  Unique genes                : {:,}", len(gene_df))
+
+    if "worst_impact" in gene_df.columns:
         for impact in ["HIGH", "MODERATE", "LOW", "MODIFIER"]:
-            n = (freq_df["IMPACT"] == impact).sum()
-            print(f"  {impact:<10} impact loci     : {n:,}")
+            n = (gene_df["worst_impact"] == impact).sum()
+            logger.info("  {:<10} worst-impact genes : {:,}", impact, n)
 
-    print(f"\n  Frequency statistics:")
-    print(f"    Mean   : {freq_df['frequency'].mean():.3f}")
-    print(f"    Median : {freq_df['frequency'].median():.3f}")
-    print(f"    Max    : {freq_df['frequency'].max():.3f}")
+    logger.info("  Density statistics (variant_count / (gene_length × n_patients)):")
+    logger.info("    Mean   : {:.4e}", gene_df["density"].mean())
+    logger.info("    Median : {:.4e}", gene_df["density"].median())
+    logger.info("    Max    : {:.4e}", gene_df["density"].max())
 
-    top = freq_df.nlargest(top_n, "frequency")
-    print(f"\n  Top {top_n} most frequent variants:")
-    print(f"  {'Gene':<12} {'CHROM':<8} {'POS':<12} {'REF>ALT':<14} "
-          f"{'Freq':>7} {'Patients':>9} {'Impact'}")
-    print("  " + "-" * 72)
+    top = gene_df.nlargest(top_n, "density")
+    logger.info("  Top {} genes by density:", top_n)
+    logger.info("  {:<15} {:<8} {:>9} {:>10} {:>9} {}", "Gene", "CHROM", "Variants", "Density", "Patients", "Worst Impact")
+    logger.info("  " + "-" * 65)
     for _, row in top.iterrows():
-        gene   = str(row.get("SYMBOL", ""))[:12] or "—"
-        chrom  = str(row.get("CHROM",  ""))
-        pos    = str(int(row["POS"]))
-        allele = f"{row.get('REF', '?')}>{row.get('ALT', '?')}"[:14]
-        freq   = f"{row['frequency']:.1%}"
-        pts    = f"{int(row['patient_count'])}/{n_patients}"
-        impact = str(row.get("IMPACT", ""))
-        print(f"  {gene:<12} {chrom:<8} {pos:<12} {allele:<14} "
-              f"{freq:>7} {pts:>9} {impact}")
-    print("=" * 60)
+        gene    = str(row.get("SYMBOL", "—"))[:15]
+        chrom   = str(row.get("CHROM", ""))
+        n_var   = f"{int(row['variant_count'])}"
+        cov     = f"{row['density']:.4e}"
+        pts     = f"{int(row['patient_count'])}/{n_patients}"
+        impact  = str(row.get("worst_impact", ""))
+        logger.info("  {:<15} {:<8} {:>9} {:>10} {:>9} {}", gene, chrom, n_var, cov, pts, impact)
+
+    # ------------------------------------------------------------------
+    # Bin-level section
+    # ------------------------------------------------------------------
+    logger.info("-" * 60)
+    logger.info("  BIN LEVEL")
+    logger.info("-" * 60)
+
+    if bin_df is None or bin_df.empty:
+        logger.info("  No bin-level data available.")
+    else:
+        logger.info("  Total bins                  : {:,}", len(bin_df))
+
+        if "worst_impact" in bin_df.columns:
+            for impact in ["HIGH", "MODERATE", "LOW", "MODIFIER"]:
+                n = (bin_df["worst_impact"] == impact).sum()
+                logger.info("  {:<10} worst-impact bins  : {:,}", impact, n)
+
+        logger.info("  Density statistics (variant_count / (bin_length × n_patients)):")
+        logger.info("    Mean   : {:.4e}", bin_df["density"].mean())
+        logger.info("    Median : {:.4e}", bin_df["density"].median())
+        logger.info("    Max    : {:.4e}", bin_df["density"].max())
+
+        top_bins = bin_df.nlargest(top_n, "density")
+        logger.info("  Top {} bins by density:", top_n)
+        logger.info("  {:<30} {:<8} {:>9} {:>10} {:>9} {}", "Bin", "CHROM", "Variants", "Density", "Patients", "Worst Impact")
+        logger.info("  " + "-" * 80)
+        for _, row in top_bins.iterrows():
+            bin_name = str(row.get("bin_name", "—"))[:30]
+            chrom    = str(row.get("CHROM", ""))
+            n_var    = f"{int(row['variant_count'])}"
+            cov      = f"{row['density']:.4e}"
+            pts      = f"{int(row['patient_count'])}/{n_patients}"
+            impact   = str(row.get("worst_impact", ""))
+            logger.info("  {:<30} {:<8} {:>9} {:>10} {:>9} {}", bin_name, chrom, n_var, cov, pts, impact)
+
+    logger.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -542,14 +627,19 @@ def parse_args() -> argparse.Namespace:
                    help="Folder containing per-patient Parquet files.")
     p.add_argument("--output-dir", type=Path, default=default_output,
                    help="Directory where output plots and tables will be saved.")
-    p.add_argument("--output-name",      default="variant_distribution.png",
-                   help="Filename for the variant-level plot.")
     p.add_argument("--gene-output-name", default="gene_distribution.png",
                    help="Filename for the gene-level plot.")
     p.add_argument("--top",      type=int,   default=15,
                    help="Number of top variants/genes to annotate.")
     p.add_argument("--min-freq", type=float, default=0.0,
                    help="Minimum frequency threshold to display (0–1).")
+    p.add_argument("--max-gnomad-af", type=float, default=0.01,
+                   help=(
+                       "Maximum gnomADg allele frequency (0–1). "
+                       "Variants with gnomADg_AF above this value are excluded. "
+                       "Variants absent from gnomAD (NULL) are always retained. "
+                       "Default 0.01 is appropriate for rare-disease studies such as hypotonia."
+                   ))
     p.add_argument("--no-show",  action="store_true",
                    help="Skip the interactive plot window; only save to file.")
     p.add_argument("--bin-length",  type=int, default=1_000_000,
@@ -577,22 +667,25 @@ def main() -> None:
     if args.no_show:
         plt.switch_backend("Agg")
 
-    print(f"\n[1/4] Streaming patient Parquet files "
-          f"(bin_length={args.bin_length:,} bp, overlap={args.bin_overlap:,} bp) …")
-    freq_df, gene_df, bin_df, n_patients = stream_aggregate(
+    logger.info(
+        "[1/3] Streaming patient Parquet files "
+        "(bin_length={:,} bp, overlap={:,} bp, max_gnomad_af={}) …",
+        args.bin_length, args.bin_overlap, args.max_gnomad_af,
+    )
+    gene_df, bin_df, n_patients = stream_aggregate(
         args.input_dir, args.bin_length, args.bin_overlap,
+        max_gnomad_af=args.max_gnomad_af,
     )
 
-    print("\n[2/4] Building genomic layout …")
-    offsets = build_chrom_offsets(freq_df)
-    freq_df = assign_cumulative_pos(freq_df, offsets)
+    logger.info("[2/3] Building genomic layout …")
+    offsets = build_chrom_offsets(gene_df)
     gene_df = assign_cumulative_pos(gene_df, offsets)
     if not bin_df.empty:
         bin_df = assign_cumulative_pos(bin_df, offsets)
 
-    print_summary(freq_df, n_patients, top_n=args.top)
+    print_summary(gene_df, bin_df, n_patients, top_n=args.top)
 
-    print("\n[3/4] Saving aggregation results …")
+    logger.info("[3/3] Saving aggregation results …")
     run_dir = args.output_dir / datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     gene_csv = run_dir / "gene_level_analysis.csv"
@@ -600,15 +693,15 @@ def main() -> None:
     gene_df.to_csv(gene_csv, index=False)
     if not bin_df.empty:
         bin_df.to_csv(bin_csv, index=False)
-    print(f"  Gene-level results  : {gene_csv.resolve()}")
+    logger.info("Gene-level results  : {}", gene_csv.resolve())
     if not bin_df.empty:
-        print(f"  Bin-level results   : {bin_csv.resolve()}")
+        logger.info("Bin-level results   : {}", bin_csv.resolve())
 
-    print("\n[4/4] Generating plots …")
+    logger.info("Generating plots …")
     make_gene_figure(
         gene_df, offsets, n_patients,
         top_n=args.top,
-        min_freq=args.min_freq,
+        min_density=args.min_freq,
         output_path=run_dir / args.gene_output_name,
     )
     make_bin_figure(
@@ -616,10 +709,10 @@ def main() -> None:
         bin_length=args.bin_length,
         overlap=args.bin_overlap,
         top_n=args.top,
-        min_freq=args.min_freq,
+        min_density=args.min_freq,
         output_path=run_dir / args.bin_plot_name,
     )
-    print("\nDone.")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":

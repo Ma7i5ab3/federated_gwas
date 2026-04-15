@@ -2,5 +2,6 @@ venv
 .venv
 */__pycache__/
 output/synthetic_patients/
+output/distribution_analysis/*
 .DS_STORE
 __pycache__
